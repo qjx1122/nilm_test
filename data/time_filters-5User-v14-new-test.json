@@ -1,0 +1,223 @@
+{
+  "_comment_": "[v12/v13/v13.5/v13.16] 每用户批量配置示例. 完整支持 6 类字段: (1) time_filter 时段过滤 - 全局 train/infer 数据加载阶段的 include/exclude (v12, 配置在顶层 train:/infer: 字段); (2) d87 守卫开关 - guard_enabled 字段 (v13); (3) per-split time_filter - splits.train/val/test 三集独立 include/exclude (v13); (4) 目标分路列名 - target_col 字段 (v13/v13.4-fix/v13.16, 格式 pN 或 pA+pB[+pC...], N ≥ 0 整数, 优先级高于文件名 -Ch{N}- 反推); (5) [v13.5 新增] common 常量覆盖 - 9 个字段 (on_thr_w/split_ratios/split_strategy/post_min_on/post_fill_short_off/weather_latitude/weather_longitude/use_weather_features/use_temp_based_season), 未指定则用 common.py 默认; (6) _default 兜底. 用 --time-filter-config 传给 run_batch_users.py.",
+
+  "_v1316_composite_target_col_note_": "[v13.16] target_col 复合语义: 若填写 'p1+p2' 或 'p1+p2+p3', 加载分路 CSV 时自动新增一列 (列名就是复合字符串), 值 = 分量按行求和 (skipna=False, 任一分量缺则该行 NaN 传播). 分量正则: 每个 pN 须 N ≥ 0 整数. 空白/大小写不敏感 (P1 + p2 -> p1+p2). 防呆: 重复分量 (p1+p1) 拒绝. 用户示例 p1=[24,16,16,16] p2=[8,0,0,8] 配 'p1+p2' -> [32,16,16,24]. 向后兼容: 单列 'p1' 完全不触发物化. 使用场景: 同一空调有多个分路 (主机+辅热/多室内机), 需合并作为总标签.",
+
+  "_v135_common_overrides_note_": "[v13.5] common 常量覆盖字段完整说明: (a) on_thr_w: float, 空调 ON 判定阈值 (W), 训练+评估同口径, 默认 10.0; (b) split_ratios: [f,f,f], 训练/验证/测试比例, 和 = 1.0 (自动归一化), 默认 [0.6,0.2,0.2]; (c) split_strategy: 'stratified_day'/'stratified'/'time', 默认 stratified_day; (d) post_min_on: int >=0, 后处理最小连续 ON 步数, 默认 1; (e) post_fill_short_off: int >=0, 后处理短 OFF 间隙填充步数, 默认 3; (f) weather_latitude: -90~90 (跨城市部署), 默认 30.59 武汉; (g) weather_longitude: -180~180, 默认 114.31; (h) use_weather_features: bool, 是否启用温度特征, 默认 true (关掉会降 5-15% 精度); (i) use_temp_based_season: bool, 是否用温度驱动季节路由, 默认 true. 校验策略: 非法值 WARN + 忽略, 回退到 common.py 默认.",
+
+  "_semantics_v13_splits_": "[v13 per-split 语义] Step 1 原策略切分 (stratified_day) 得初始 train/val/test; Step 2 include 硬锚定 (样本粒度): 若样本 ∈ split X.include 则强制归 X, 冲突时按 train->val->test 顺序取第一个匹配并 WARN; Step 3 严格保持形状: include 强制导致某 split 过剩时, 从该 split 非锚定样本让出到不足的 split (跨 split 平移补齐); Step 4 exclude (样本粒度): 若样本已属 split X 且 t ∈ X.exclude 则移出该 split 送回重分配池, 若样本被 3 个 split.exclude 全部命中则完全丢弃.",
+
+  "_v135_full_example_": {
+    "_note_": "[v13.5 完整字段示例, 仅供参考 (键名开头下划线自动跳过, 不当用户处理)]",
+    "target_col": "p2",
+    "guard_enabled": true,
+    "on_thr_w": 50.0,
+    "split_ratios": [0.7, 0.15, 0.15],
+    "split_strategy": "stratified_day",
+    "post_min_on": 2,
+    "post_fill_short_off": 3,
+    "weather_latitude": 39.90,
+    "weather_longitude": 116.40,
+    "use_weather_features": true,
+    "use_temp_based_season": true,
+    "train": {"exclude": []},
+    "infer": {"exclude": []},
+    "splits": {}
+  },
+
+  "800080252842_4206894986488": {
+    "_note_": "[v3b 恢复] v2 基础上加 6-10 中档天 (放弃 v3 的 OFF 加量), 在分类指标最优.2026-06-29这天有空调启动特征, 但分路数据全0; 2026-6-05、2026-6-15、2026-6-24和2026-6-25分路数据不完整; 2026-06-08~2026-06-10为小负荷,可能误识别成未开空调",
+    "guard_enabled": false,
+    "target_col": "p1",
+    "enable_auto_split": true,
+    "auto_split_mode": "balanced",
+    "train": {
+      "include": [
+        ["2025-07-10", "2026-06-03"],
+        ["2026-06-04", "2026-06-04"],
+        ["2026-06-08", "2026-06-10"]
+      ],
+      "exclude": [
+        ["2025-07-29", "2025-07-29"],
+        ["2026-04-17", "2026-04-18"]
+      ]
+    },
+    "infer": {
+      "exclude": [
+        ["2025-07-10", "2026-06-03"],
+        ["2026-06-04", "2026-06-04"],
+        ["2026-06-08", "2026-06-10"],
+        ["2026-06-15", "2026-06-15"],
+        ["2026-06-24", "2026-06-25"],
+        ["2026-06-29", "2026-06-29"]
+      ]
+    },
+    "v14": {
+      "v14_enable": true,
+      "physics": true,
+      "focal": true,
+      "ensemble": true,
+      "calibrate": false,
+      "auto_config": true,
+      "health": true,
+      "diag": true
+    }
+  },
+  "800080252844_4206894986488": {
+    "_note_": "[v13] 变频空调用户。d87 尖峰弱, 显式关闭守卫 (否则推理会 100% FN).2026-6-4、2026-6-21均有明显空调开启特征, 但分路数据为0; 2026-6-28均有明显空调开启特征, 但从分路数据看, 开启时间只有1小时; 2026-6-22分路看有空调开启, 但总线没有空调开启特征, 疑似其它设备干扰",
+    "guard_enabled": true,
+    "target_col": "p2",
+    "enable_auto_split": true,
+    "auto_split_mode": "balanced",    
+    "train": {
+      "include": [
+        ["2025-07-10", "2026-06-01"]
+      ],
+      "exclude": [
+        ["2025-07-22", "2025-07-22"],
+        ["2025-07-28", "2025-07-28"]
+      ]
+    },
+    "infer": {
+      "exclude": [
+        ["2025-07-10", "2026-06-01"],
+        ["2026-06-04", "2026-06-04"],
+        ["2026-06-21", "2026-06-22"],
+        ["2026-06-28", "2026-06-28"]
+      ]
+    },
+    "v14": {
+      "v14_enable": true,
+      "physics": true,
+      "focal": true,
+      "ensemble": true,
+      "calibrate": false,
+      "auto_config": true,
+      "health": true,
+      "diag": true
+    }
+  },
+  "800080270778_4200903422131": {
+    "_note_": "[v13] 变频小功率空调用户, 显式关闭守卫",
+    "target_col": "p2",
+    "on_thr_w": 50.0,
+    "guard_enabled": false,
+    "enable_auto_split": true,
+    "auto_split_mode": "balanced",    
+    "train": {
+      "include": [
+        ["2026-05-21", "2026-06-08"],
+        ["2026-07-01", "2026-07-08"]
+      ]
+    },
+    "infer": {
+      "exclude": [
+        ["2026-05-21", "2026-06-08"],
+        ["2026-07-01", "2026-07-08"],
+        ["2026-06-20", "2026-06-20"],
+        ["2026-06-24", "2026-06-25"]
+      ]
+    },
+    "v14": {
+      "v14_enable": true,
+      "physics": true,
+      "focal": true,
+      "ensemble": true,
+      "calibrate": false,
+      "auto_config": true,
+      "health": true,
+      "diag": true
+    }
+  },
+  "800080270789_4206680982373": {
+    "_note_": "[v13] 变频小功率空调用户, 显式关闭守卫",
+    "target_col": "p1+p2",
+    "on_thr_w": 60.0,
+    "guard_enabled": false,
+    "enable_auto_split": true,
+    "auto_split_mode": "balanced",      
+    "train": {
+      "include": [
+        ["2026-05-21", "2026-06-06"],
+        ["2026-06-09", "2026-06-10"],
+        ["2026-06-12", "2026-06-13"],
+        ["2026-06-15", "2026-06-15"],
+        ["2026-06-17", "2026-06-19"],
+        ["2026-06-21", "2026-06-21"],
+        ["2026-06-23", "2026-06-24"],
+        ["2026-06-26", "2026-06-29"]
+      ]
+    },
+    "infer": {
+      "include": [
+        
+      ],
+      "exclude": [
+        ["2026-05-21", "2026-06-06"],
+        ["2026-06-09", "2026-06-10"],
+        ["2026-06-12", "2026-06-13"],
+        ["2026-06-15", "2026-06-15"],
+        ["2026-06-17", "2026-06-19"],
+        ["2026-06-21", "2026-06-21"],
+        ["2026-06-23", "2026-06-24"],
+        ["2026-06-26", "2026-06-29"],
+
+        ["2026-06-08", "2026-06-08"]
+      ]
+    },
+    "v14": {
+      "v14_enable": true,
+      "physics": true,
+      "focal": true,
+      "ensemble": true,
+      "calibrate": false,
+      "auto_config": true,
+      "health": true,
+      "diag": true
+    }
+  },
+  "800080270800_4200904302272": {
+    "_note_": "[v13] 变频小功率空调用户, 显式关闭守卫",
+    "target_col": "p1",
+    "on_thr_w": 50.0,
+    "guard_enabled": false,
+    "enable_auto_split": true,
+    "auto_split_mode": "balanced",    
+    "train": {
+      "include": [
+        ["2026-05-27", "2026-06-01"],
+        ["2026-06-13", "2026-06-15"],
+        ["2026-06-17", "2026-06-18"],
+        ["2026-06-21", "2026-06-23"]
+      ]
+    },
+    "infer": {
+      "exclude": [
+        ["2026-05-27", "2026-06-01"],
+        ["2026-06-13", "2026-06-15"],
+        ["2026-06-17", "2026-06-18"],
+        ["2026-06-21", "2026-06-23"]
+      ]
+    },
+    "v14": {
+      "v14_enable": true,
+      "physics": true,
+      "focal": true,
+      "ensemble": true,
+      "calibrate": false,
+      "auto_config": true,
+      "health": true,
+      "diag": true
+    }
+  },
+
+  "_default": {
+    "_note_": "[v13] 未在上面显式列出的用户会读这个 _default 配置。guard_enabled=true 表示默认开启守卫 (对定频空调最有效),如果没指定，则表示自动检测",
+    "train": {
+      "exclude": []
+    },
+    "infer": {
+      "exclude": []
+    }
+  }
+}
