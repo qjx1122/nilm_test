@@ -6158,3 +6158,10 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 - 关键决策：Stage-2-only 在分类逐项不变时把公平19日 MAE改善44.18W、ON少估改善18.10pp，作为最终结构；动态/冻结 hard-negative 和 combined 的公平F1均下降，不采纳且不得用缩小后的共同 inference 冒充最终验收；nuisance 在 fixed validation 自动选择 `alpha=0`，保留安全回退；scale/L4只在3/6 validation日期达到MAE改善，未过严格多数门，最终只路由raw；禁止再以低净SAE掩盖ON少估/OFF误报。
 - 未决问题：共同 inference F1仍为81.08%且有286个FP、62.04kWh OFF虚假能耗，未达到F1≥90%的生产联合验收；后续需要来自独立训练来源的新p3/p4干扰标签和更强非线性/多任务nuisance表征，不能污染当前共同 inference；`test_train_infer_symmetry.py`仍依赖仓库外历史产物，当前无法执行。
 - 相关文件/分支：`scripts/03_train.py`、`scripts/04_evaluate.py`、`scripts/05_inference.py`、`scripts/model_feature_views.py`、`scripts/metrics_utils.py`、`scripts/test_stage_views_and_energy.py`、`artifacts/validation_0789_final_stage2_raw/`、`REPORT_TEST.md`、`STATUS.md`、分支 `arena/019ff3f3-nilm-test`。
+
+## [2026-08-12] 会话纪要（口径完整性补充）
+- 目标：严格核对“共同 inference 不得用于训练”后固化最终模型状态。
+- 完成项：确认 Stage-2-only 的07-08~10原属基线共同22日，因此19日结果降级为开发消融；使用原固定20/6/6 split、无 Stage-2-only 日期再次完整强制重训 `validation_0789_final_uncontaminated_raw`，1/1成功；当前模型 `stage2_only_dates=[]`、`selected_stage2_layer=raw`。fixed test F1/MAE/SAE=`96.1661%/192.977W/0.2449%`，原共同22日 inference=`83.7433%/296.075W/9.0469%`，ON偏差`-28.0342%`、OFF虚假能耗`58.4678kWh`。
+- 关键决策：最终验收只认未污染22日口径；Stage-2-only的回归改善只证明方向，不可替代共同 inference 验收。因共同22日F1和ON偏差均不达标，当前没有通过联合验收的生产模型。
+- 未决问题：需要现有共同 inference 之外的独立高功率和p3/p4干扰训练数据，并建立新的未见共同holdout后才能继续申请验收。
+- 相关文件/分支：`artifacts/validation_0789_final_uncontaminated_raw/`、`REPORT_TEST.md`、`STATUS.md`、`models/800080270789_4206680982373/`、分支 `arena/019ff3f3-nilm-test`。

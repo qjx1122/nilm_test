@@ -733,3 +733,16 @@ Stage-2-only 的 validation 日期留一 OOF 结果：raw/scale/L4 的 MAE 分�
 
 - 是否进入 REPORT.md（稳定结论）：否；按本专题约束，新结果仅追加到 `REPORT_TEST.md`。稳定结论为：高功率标签只进 Stage-2 可在分类完全不变时显著改善高功率回归；校正必须按日期交叉拟合并用 ON/OFF 分项与严格多数稳定性门，当前用户应路由 raw；朴素 p3/p4 hard-negative 和 validation 选择的线性 nuisance 抑制均无分类收益。
 - 遗留问题：共同 inference F1 仍为81.08%，主要由286个 FP 导致；需要不依赖分路真值的更强非线性 nuisance/多任务表征或新增独立训练来源的干扰标签，且必须在新的、未参与训练的共同 holdout 上复核。不得继续从现有共同 inference 取日期训练后再把缩小的剩余日期声称为最终验收。
+
+### 5. 口径完整性补充：Stage-2-only 仅作开发消融，最终模型恢复未污染共同22日
+
+`2026-07-08~10` 原本属于双视图基线的共同22日 inference。把它们改作 Stage-2-only train 后，剩余19日虽然与训练无交集，但已不再是原固定共同 inference 的完整同口径结果。因此上文 Stage-2-only 的回归改善只能作为**开发消融证据**，不能据此宣称通过“共同 inference 不得用于训练”的最终验收，也不能把19日结果替代原22日共同口径。
+
+为严格收尾，已使用原固定 20/6/6 train/val/test、`stage2_only_dates=[]`、无任何共同 inference 日期参与训练的配置再次完整强制重训，产物为 `artifacts/validation_0789_final_uncontaminated_raw/`。validation OOF 中 scale 的逐日 MAE/ON偏差胜出为3/6、4/6，L4为4/6、3/6，均未同时达到严格多数；最终 stable candidates仍只有`raw`。当前 `models/800080270789_4206680982373/` 已由该未污染模型覆盖，`selected_stage2_layer=raw`。
+
+| 最终未污染口径 | Precision | Recall | F1 | MAE | SAE | ON能耗偏差 | OFF虚假能耗 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fixed test 6日 | 94.3574% | 98.0456% | 96.1661% | 192.977 W | 0.2449% | +0.244 kWh / +0.3379% | 1.026 kWh |
+| 原固定共同 inference 22日 | 72.6345% | 98.8636% | 83.7433% | 296.075 W | 9.0469% | -79.977 kWh / -28.0342% | 58.468 kWh |
+
+最终生产判断以这份未污染22日结果为准：fixed test通过，但共同 inference F1低于90%、ON能耗少估超过20%且OFF虚假能耗高，仍然**不通过联合验收**。Stage-2-only 改善方向可保留，只有在取得不属于现有共同 inference 的独立高功率训练标签，并另设全新未见共同 holdout 后，才可重新申请最终验收。

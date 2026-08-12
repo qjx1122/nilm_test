@@ -1,7 +1,7 @@
 # STATUS.md
 
 ## 当前目标
-- 已完成：针对用户 `800080270789_4206680982373` 实现 Stage-1/Stage-2 独立样本与特征视图、Stage-2-only 高功率标签、p3/p4 hard-negative/nuisance 消融、按 validation 自然日交叉拟合校正选层，以及 ON/OFF 无抵消指标。最终固定 test 通过，但共同 19 日 inference F1 `81.08% < 90%`，整体联合验收未通过。
+- 已完成：针对用户 `800080270789_4206680982373` 实现 Stage-1/Stage-2 独立样本与特征视图、Stage-2-only 高功率标签、p3/p4 hard-negative/nuisance 消融、按 validation 自然日交叉拟合校正选层，以及 ON/OFF 无抵消指标。Stage-2-only 作为开发消融；最终模型恢复为不使用任何共同 inference 日期的 raw 路由。固定 test 通过，但原固定共同22日 inference F1 `83.74% < 90%`，整体联合验收未通过。
 
 ## 已完成
 - [x] 2026-08-12 完成开局仪式、`.venv` 依赖恢复和 GitHub/远端检查。
@@ -29,7 +29,8 @@
 - [x] 实现只从固定 train 拟合的总线侧 nuisance 辅助分类器及 validation-only 抑制强度选择；本用户自动选择 `alpha=0`，共同22日 F1保持基线 `83.7433%`，安全回退。
 - [x] 将 raw/scale/L4 改为按6个 validation 自然日留一交叉拟合，并加入 SAE、ON偏差、OFF虚假能耗和逐日严格多数稳定门；最终 stable candidates 仅 `raw`，避免旧 scale 在共同19日 SAE恶化至 `30.57%`。
 - [x] 标准指标新增 `ON_kWh_true/ON_kWh_pred/ON_kWh_err/ON_energy_bias/OFF_false_kWh`，批量汇总同步输出；修复用户级 `NILM_USER_ON_THR_W` 未被分项指标默认读取的问题并完整重跑。
-- [x] 最终可复现实验 `validation_0789_final_stage2_raw` 1/1成功：fixed test F1 `96.1661%`、MAE `184.522W`、SAE `0.6974%`；共同19日 inference F1 `81.0811%`、MAE `258.116W`、SAE `14.1793%`、ON偏差 `-11.2491%`、OFF虚假能耗 `62.0411kWh`。
+- [x] Stage-2-only 开发消融 `validation_0789_final_stage2_raw` 1/1成功：fixed test F1 `96.1661%`、MAE `184.522W`、SAE `0.6974%`；剩余19日 OOD F1 `81.0811%`、MAE `258.116W`、SAE `14.1793%`、ON偏差 `-11.2491%`、OFF虚假能耗 `62.0411kWh`。因07-08~10原属共同 inference，该结果不作为最终共同口径验收。
+- [x] 严格未污染收尾 `validation_0789_final_uncontaminated_raw` 1/1成功：`stage2_only_dates=[]`，当前模型为 raw；fixed test F1/MAE/SAE=`96.1661%/192.977W/0.2449%`，原共同22日 inference=`83.7433%/296.075W/9.0469%`，ON偏差`-28.0342%`、OFF虚假能耗`58.4678kWh`。
 - [x] 全部源码 `py_compile`、`git diff --check` 与6个自包含测试脚本通过；`test_train_infer_symmetry.py` 仍因仓库外历史产物缺失不可运行，不判定为源码回归。
 
 ## 进行中
@@ -57,10 +58,10 @@
 - 当前 L5 fallback 与 summer expert 在此用户上同源同算法（全部训练样本均为 summer），不构成真正模型多样性；E4 固定 val 的 50/50 代理位于 raw/L4 之间，独立 test/inference 仅改善 0.52/0.76 W MAE且 SAE 更差，不推荐据此启用同源混合。
 - L4 使用同一 validation 拟合和报告会产生明显乐观偏差：E4 val MAE 改善 48.93 W，但独立 test 恶化 3.36 W。后续层选择必须另设 selection fold 或交叉拟合。
 - 有界乘性校正只通过了独立 test 的净 SAE 验证，未通过 ON/OFF 分项验收；共同 inference 仍为 ON -46.47 kWh、OFF +58.47 kWh，故不接入 bundle。
-- 高功率标签方向必要但不能朴素混入统一训练：E3 高档预测显著改善，却使固定 test F1 降至 88.03%。本轮已通过 `NILM_STAGE2_ONLY_DATES` 实现只进 Stage-2，fixed test F1恢复为96.17%且 inference ON少估显著改善。
+- 高功率标签方向必要但不能朴素混入统一训练：E3 高档预测显著改善，却使固定 test F1 降至 88.03%。本轮 `NILM_STAGE2_ONLY_DATES` 使 fixed test F1恢复为96.17%且剩余19日 ON少估显著改善；但07-08~10原属共同 inference，因此只能作为开发消融，不能进入最终未污染模型。
 - p3/p4 四个干扰日来自共同 inference；动态/冻结 hard-negative 和 combined 均只可作诊断，不能把缩小后的18/15日结果冒充最终共同 inference 验收。两种 hard-negative均未提升公平F1。
 - nuisance 辅助模型必须在推理时只读总线特征，分路 p3/p4 只可作为 train 标签；抑制强度只由 fixed validation 选择。本用户 `alpha=0` 是有效的安全回退，不应为追求现有 inference 分数强行开启。
-- 校正层的聚合净 SAE可被 ON少估与OFF误报抵消。最终选层要求 validation 日期留一 OOF、ON/OFF分项门和逐日严格多数；Stage-2-only 的 scale/L4均只在3/6日达到MAE改善，故 raw 是唯一稳定候选。
+- 校正层的聚合净 SAE可被 ON少估与OFF误报抵消。最终选层要求 validation 日期留一 OOF、ON/OFF分项门和逐日严格多数；Stage-2-only与未污染重跑中均无校正层同时通过MAE/ON偏差严格多数，故 raw 是唯一稳定候选。
 - 用户级 ON 阈值由 `NILM_USER_ON_THR_W` 注入到各子进程局部全局量；指标工具若只读 `common.py` 默认10W会错误分解ON/OFF。本轮已改为优先读取环境变量并增加回归测试。
 - 仓库没有 `setup.sh`，按 README / `requirements.txt` 使用 `.venv`。当前 Python 3.11.2 与 README 推荐 3.10 不同，固定依赖和现有自包含测试均通过。
 - `scripts/test_train_infer_symmetry.py` 硬编码依赖仓库外历史产物，当前缺失导致 `FileNotFoundError`，不判定为源码回归。
@@ -74,7 +75,8 @@
 - 0789 本轮优化实验：`artifacts/validation_0789_opt_baseline/`、`validation_0789_opt_fixed_split/`、`validation_0789_opt_fixed_features/`、`validation_0789_opt_train_features/`、`validation_0789_opt_high_power/`
 - 本轮代码：`scripts/03_train.py`、`scripts/04_evaluate.py`、`scripts/05_inference.py`、`scripts/model_feature_views.py`、`scripts/metrics_utils.py`、`scripts/test_fixed_top_cols.py`、`scripts/test_stage_views_and_energy.py`
 - 双视图/消融产物：`artifacts/validation_0789_stage_views_cv/`、`validation_0789_stage2_high_only/`、`validation_0789_hardneg_only/`、`validation_0789_hardneg_frozen/`、`validation_0789_combined/`、`validation_0789_nuisance_suppress/`
-- 最终推荐实验产物：`artifacts/validation_0789_final_stage2_raw/`；当前模型：`models/800080270789_4206680982373/`（`selected_stage2_layer=raw`）
+- Stage-2-only开发消融：`artifacts/validation_0789_final_stage2_raw/`
+- 最终未污染实验产物：`artifacts/validation_0789_final_uncontaminated_raw/`；当前模型：`models/800080270789_4206680982373/`（`stage2_only_dates=[]`、`selected_stage2_layer=raw`）
 - 最终批量日志：`logs/_batch/batch_run_20260812_033731.log`、`logs/_batch/batch_run_20260812_034712.log`
 - 因果实验日志：`logs/_batch/batch_run_20260812_041238.log`、`logs/_batch/batch_run_20260812_041533.log`
 - 会话纪要：`session/NILM_AC_session_complete.md`
