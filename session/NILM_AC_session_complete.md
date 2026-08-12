@@ -6137,3 +6137,10 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 - 关键决策：首次预跑发现未变化用户 `800080252844_4206894986488` 的第二套结果异常，未因 exit 0 直接采信；定位到 `common.py` 同秒等长改写造成旧 pyc 误读目标列，修复缓存清理、增加组合目标替换校验与子进程回归后，删除预跑产物并完整重跑。每日 `TP=FP=FN=0` 的 F1=0 记录保留但标记为“不适用”，不计模型失败。目标用户测试配置只判定为分类改善、能耗回归退化，不推荐直接替换原配置。
 - 未决问题：目标用户需在固定日期切分下修复 Stage-2 功率低估；用户 `800080270800_4200904302272` 仍有大量全关误报且推理 F1/SAE 为 58.95%/93.97%；指标层建议增加 `f1_applicable` 或将无正类日 F1 输出为 N/A。
 - 相关文件/分支：`REPORT_TEST.md`、`STATUS.md`、`scripts/run_user_pipeline.py`、`scripts/test_composite_target_col.py`、`artifacts/validation_v14_new/`、`artifacts/validation_v14_new_test/`、分支 `arena/019ff3f3-nilm-test`。
+
+## [2026-08-12] 会话纪要
+- 目标：详细分析 0789 用户增加 2026-06-05、06-06 全关训练日后评估指标变差的原因，并给出可执行优化方案。
+- 完成项：执行固定 split 反事实实验和原基线确定性重放；确认两个新增日是 p3/p4 大负载造成的高相似 hard negative；将共同 22 个推理日按真实 ON/OFF 拆分能耗，识别原低 SAE 的正负错误抵消；定位自动日切分重排、全量相关性 Top-3 翻转导致 16 个派生特征替换、高功率 OOD/P50 压缩、L4 限幅和 L5 同源 fallback 五条退化路径；在固定 val 拟合 1.1138 候选乘性校正并用固定 test/推理验证；完整结论与 P0/P1/P2 方案追加到 `REPORT_TEST.md`。
+- 关键决策：保留两个全关日但仅服务 Stage-1 hard-negative 学习；以固定 split 的 C 模型作为短期基线，不采用自动重排的 B，也不以 A 的误差抵消低 SAE 为目标；后续必须把 split、特征选择和 Stage-2 数据视图解耦，并用 ON 能耗偏差与 OFF 虚假能耗分项验收。
+- 未决问题：尚未实现 split manifest、train-only/ON-only 特征选择、用户级 raw/L4/L5 开关和 Stage-2 乘性校正；固定 C 的 F1 84.07%仍低于 90%，需加入更多 p3/p4 hard negatives和 7 月 1400–2300 W 高功率标签。
+- 相关文件/分支：`REPORT_TEST.md`、`STATUS.md`、`artifacts/analysis_0789_fixed_split_alloff/`、`artifacts/analysis_0789_baseline_replay/`、分支 `arena/019ff3f3-nilm-test`。

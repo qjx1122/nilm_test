@@ -1,7 +1,7 @@
 # STATUS.md
 
 ## 当前目标
-- 已完成：分别以 `data/time_filters-5User-v14-new.json` 与 `data/time_filters-5User-v14-new-test.json` 对 5 用户执行隔离、强制重训验证，并对所有每日 `F1 < 0.90` 或 `SAE > 0.20` 的记录完成逐日归因与配置对比。
+- 已完成：针对用户 `800080270789_4206680982373` 增加 2026-06-05、06-06 全关训练日后指标变差的问题，完成固定切分反事实、确定性重放、分层能耗误差和代码路径因果分析，并给出分优先级优化方案。
 
 ## 已完成
 - [x] 2026-08-12 完成开局仪式、`.venv` 依赖恢复和 GitHub/远端检查。
@@ -12,14 +12,20 @@
 - [x] 完成 318+318 个用户日指标筛选：v14-new 原始命中 117（有效异常 94）；v14-new-test 原始命中 119（有效异常 92）。全部命中日期及指标、覆盖和归因已追加到 `REPORT_TEST.md`。
 - [x] 完成目标用户与总体对比：测试配置使目标用户推理 F1 74.39%→81.67%，但 SAE 10.30%→23.39%、MAE 344.24→378.53 W；结论为分类改善、回归退化，不能作为无条件优胜配置。
 - [x] 完成最终回归：4 个自包含测试脚本共 140/140 断言通过；`time_filter_utils.py` 自测、v6.15 守卫压力脚本、`compileall` 和 `git diff --check` 均通过。
+- [x] 新增 0789 固定切分反事实实验：保留两个全关 hard negative，但固定原有 30 天的 split，仅把 06-05/06-06 锚定 train；1/1 成功，耗时 111.5 秒。
+- [x] 固定切分模型在共同 22 个推理日达到 F1 84.07%、SAE 11.15%、MAE 283.26 W，显著优于自动重排模型的 81.67%/23.39%/378.53 W；证明主要退化来自 split/特征/Stage-2 联动，而不是全关日不可用。
+- [x] 重放原配置基线并核验训练、推理每日 CSV SHA-256 与原运行完全一致；完成 ON/OFF 能耗拆分，确认原 SAE 1.14% 是 ON 低估 -73.28 kWh 与 OFF 误报 +76.60 kWh 偶然抵消。
+- [x] 定位结构性原因：新增 OFF 日使 Top-3 相关性排名翻转并替换 16 个 Stage-2 派生特征；自动切分替换 104/101 个 ON 样本；P50 树模型对 ≥1400 W OOD 功率严重压缩；L4 ±150 W 和同源 fallback 的 L5 不能稳定修复。
+- [x] 在固定 val 上拟合候选乘性校正系数 1.1138；独立固定 test 的 raw SAE 8.67%→1.72%，共同推理 raw SAE 9.99%→0.25%、MAE 283.63→265.02 W。结论及实施顺序已追加到 `REPORT_TEST.md`。
 
 ## 进行中
-- 无；本次验证专题已完成并固化。
+- 无；本次原因分析与方案设计已固化，尚未按方案修改生产代码。
 
 ## 下一步（TODO）
-1. 若继续优化目标用户，先固定 train/val/test 日期集合，再单独调优 Stage-2 功率回归，避免 `stratified_day` 重排混入 A/B 结论。
-2. 优先处理用户 `800080270800_4200904302272` 的大量全关误报和推理 SAE 93.97%。
-3. 考虑将无正类日的 F1 输出为 N/A，或增加 `f1_applicable` 字段，避免 `TP=FP=FN=0` 的正确全关日被机械筛为异常。
+1. P0：为 0789 配置持久化固定 split；保留全关 hard negative，但仅用于 Stage-1；以固定 val/test 选择 raw/L4/L5 并复验乘性校正。
+2. P1：实现追加不变的 split manifest、train-only 预处理、Stage-1/Stage-2 双特征选择器，以及 ON 偏差/OFF 虚假能耗分项指标。
+3. P2：补充 7 月 1400–2300 W 高功率标签，比较 P50、Huber/平方损失及 P50/P90 混合，目标同时达到 F1≥90%、SAE≤20%。
+4. 后续再处理用户 `800080270800_4200904302272` 的大量全关误报和推理 SAE 93.97%。
 
 ## 决策记录 / 踩坑
 - 本会话固定在 Arena 分支 `arena/019ff3f3-nilm-test`，不另建或切换分支（优先遵守会话运行环境约束）。
@@ -29,6 +35,11 @@
 - 数据缺失不是主要异常来源：两套各仅 1 个有效异常日覆盖不足，均为用户 `800080252842_4206894986488` 的 2026-06-05 推理日（76 个对齐样本）。
 - 目标用户新增两天后 `stratified_day` 还重排了 5 个既有日期的 split，因此 val/test 前后值并非固定评估集上的纯模型 A/B；推理共同 22 天对比才用于拆分口径与模型效应。
 - pooled SAE 会让不同用户的正负误差抵消：测试配置 pooled 推理 SAE 看似 6.12%→5.15%，但 5 用户宏平均 SAE 实际 26.08%→28.70%，目标用户本身也明显恶化。
+- 0789 的原配置在共同推理日也存在同类抵消：真实 ON 低估 73.28 kWh、真实 OFF 误报多算 76.60 kWh，净 SAE 才呈现 1.14%。因此优化验收必须同时看 ON 能耗偏差和 OFF 虚假能耗，不能只看净 SAE。
+- 06-05/06-06 是有效 hard negative：`p1+p2` 完整全零，但 p3/p4 分别消耗 5.62/13.10 与 7.51/8.61 kWh，总线信号接近真实 ON；应保留给分类器，而不是混入 Stage-2 特征选择和 ON 回归数据视图。
+- 固定 split 反事实是本次核心决策：C 相比 B 在相同新增数据下只改变 split 归属，故 C→B 的 F1 -2.40pp、SAE +12.24pp、MAE +95.28 W 可归因于切分重排及其后续 Stage-2/L4 变化。
+- 当前相关性 Top-K 在 split 前用全量标签拟合，新增 OFF 日使相关性排名变化并替换 16 个 Top-3 派生特征，存在标签泄漏和增量不稳定；后续必须改为 train-only，并为 Stage-2 使用 ON-only/冻结特征清单。
+- 当前 L5 fallback 与 summer expert 在此用户上同源同算法（全部训练样本均为 summer），不构成真正模型多样性；严重漂移时 0.5 混合只会折中 raw 与 L4，B 上将 SAE 20.15%拉回 23.39%。
 - 仓库没有 `setup.sh`，按 README / `requirements.txt` 使用 `.venv`。当前 Python 3.11.2 与 README 推荐 3.10 不同，固定依赖和现有自包含测试均通过。
 - `scripts/test_train_infer_symmetry.py` 硬编码依赖仓库外历史产物，当前缺失导致 `FileNotFoundError`，不判定为源码回归。
 
@@ -37,6 +48,8 @@
 - 两份配置：`data/time_filters-5User-v14-new.json`、`data/time_filters-5User-v14-new-test.json`
 - 修复代码/回归：`scripts/run_user_pipeline.py`、`scripts/test_composite_target_col.py`
 - 最终隔离产物：`artifacts/validation_v14_new/`、`artifacts/validation_v14_new_test/`
+- 0789 因果实验：`artifacts/analysis_0789_fixed_split_alloff/`、`artifacts/analysis_0789_baseline_replay/`
 - 最终批量日志：`logs/_batch/batch_run_20260812_033731.log`、`logs/_batch/batch_run_20260812_034712.log`
+- 因果实验日志：`logs/_batch/batch_run_20260812_041238.log`、`logs/_batch/batch_run_20260812_041533.log`
 - 会话纪要：`session/NILM_AC_session_complete.md`
 - 本地环境：`.venv/`（Git 忽略）
