@@ -6123,3 +6123,20 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 ---
 
 *会话导出更新时间: 2026-07-23 (v13.17 run_batch_users 断点续跑 + --resume + 状态 CSV 实时增量写 + cleanup 白名单关键 bug 修复 + 37 单测全通过)*
+
+
+---
+
+## [2026-08-12] 会话纪要
+- 目标：根据用于批量训练和推理的数据输入输出结构和用户数据配置结构功能代码，梳理并撰写项目数据输入输出及用户配置功能要求说明文档。
+- 完成项：
+  1. 系统化归纳了批量编排层 (`run_batch_users.py`) 与单用户执行层 (`run_user_pipeline.py`) 的流向与环境映射规范。
+  2. 详细梳理了输入目录体系、总线与分路命名正则表达式 (`RE_BUS`/`RE_BR`) 规范及 `pA+pB` 复合目标的动态物化规则。
+  3. 梳理了数据输出结构与标准表字段要求 (包含 25 列每日监控 `inference_daily_metrics.csv` 的 `n_bus_raw`/`n_branch_raw`、开机段级 `min_w` 以及 `batch_execution_state.csv` 9 列格式)。
+  4. 完整规范并归档了用户配置 JSON (`time_filter_config`) 支持的 6 大配置维度与三重优先级回退规则。
+  5. 遵循 BOOTSTRAP.md 中“不新建额外文档、统一追加沉淀”要求，将《NILM 空调负荷分解 — 批量训练推理数据输入输出及用户配置规范说明书》输出至 `REPORT_TEST.md`。
+- 关键决策：严格遵循《BOOTSTRAP.md》文档治理规范，在 `REPORT_TEST.md` 中按标准分节格式建档和更新专题报告。
+- 未决问题：无。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 关键文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
