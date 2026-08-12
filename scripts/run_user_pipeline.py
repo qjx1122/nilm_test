@@ -35,21 +35,34 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
+def _clear_common_bytecode(common_path: Path) -> None:
+    """清除 common.py 的时间戳 pyc，避免同秒等长改写后子进程读到旧 TARGET_COL。"""
+    pycache_dir = common_path.parent / "__pycache__"
+    if pycache_dir.exists():
+        for pyc_path in pycache_dir.glob(f"{common_path.stem}.*.pyc"):
+            pyc_path.unlink(missing_ok=True)
+    # 兼容 Python 2 / 少数自定义加载器留下的旧式同目录 pyc。
+    common_path.with_suffix(".pyc").unlink(missing_ok=True)
+
+
 def patch_common(target_col: str):
-    """临时修改 common.py 的 TARGET_COL (备份原文件)"""
+    """临时修改 common.py 的 TARGET_COL (备份原文件)。"""
     common_path = Path(__file__).resolve().parent / "common.py"
     backup_path = common_path.with_suffix(".py.bak")
     if not backup_path.exists():
         shutil.copy(common_path, backup_path)
     content = backup_path.read_text(encoding="utf-8")
-    # 替换 TARGET_COL
+    # TARGET_COL 允许 p1+p2 等组合表达式；替换后必须让子进程重新编译 common.py。
     import re
-    new_content = re.sub(
-        r'TARGET_COL\s*=\s*"\w+"',
+    new_content, replaced = re.subn(
+        r'TARGET_COL\s*=\s*"[^"]+"',
         f'TARGET_COL = "{target_col}"',
         content, count=1
     )
+    if replaced != 1:
+        raise RuntimeError("common.py 中未找到唯一可替换的 TARGET_COL")
     common_path.write_text(new_content, encoding="utf-8")
+    _clear_common_bytecode(common_path)
     print(f"  [patch] TARGET_COL -> '{target_col}'")
 
 
@@ -59,6 +72,7 @@ def restore_common():
     if backup_path.exists():
         shutil.copy(backup_path, common_path)
         backup_path.unlink()
+        _clear_common_bytecode(common_path)
         print(f"  [restore] common.py 已恢复")
 
 
