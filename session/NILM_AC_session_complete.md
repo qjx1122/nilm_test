@@ -6144,3 +6144,10 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 - 关键决策：保留两个全关日但仅服务 Stage-1 hard-negative 学习；以固定 split 的 C 模型作为短期基线，不采用自动重排的 B，也不以 A 的误差抵消低 SAE 为目标；后续必须把 split、特征选择和 Stage-2 数据视图解耦，并用 ON 能耗偏差与 OFF 虚假能耗分项验收。
 - 未决问题：尚未实现 split manifest、train-only/ON-only 特征选择、用户级 raw/L4/L5 开关和 Stage-2 乘性校正；固定 C 的 F1 84.07%仍低于 90%，需加入更多 p3/p4 hard negatives和 7 月 1400–2300 W 高功率标签。
 - 相关文件/分支：`REPORT_TEST.md`、`STATUS.md`、`artifacts/analysis_0789_fixed_split_alloff/`、`artifacts/analysis_0789_baseline_replay/`、分支 `arena/019ff3f3-nilm-test`。
+
+## [2026-08-12] 会话纪要
+- 目标：按上一轮 P0/P1/P2 推荐方案，对用户 `800080270789_4206680982373` 执行固定 holdout 可复现优化验证，实际比较 frozen/train-only 特征、raw/L4/L5、只由 validation 拟合的有界 Stage-2 乘性校正及 7 月高功率标签。
+- 完成项：串行完成 E0 基线、E1 固定 20/6/6 日 split、E2 冻结旧 manifest、E4 train-only selector/LUT、E3 增加 07-08~10 高功率日五次隔离强制重训，均 1/1 成功；统一比较共同推理点、fixed val/test、真 ON/OFF 能耗和高功率桶；将完整结果追加到 `REPORT_TEST.md`；实现 `03_train.py` 先切分后仅用 train 拟合 Top-25 和温度功率 LUT，持久化拟合来源/日期，并增加严格的 `NILM_FIXED_TOP_COLS` 实验开关与回归测试；141/141 自包含断言、编译及 diff 检查通过。
+- 关键决策：E1 的共同推理 F1 84.07%最高，E4 F1 小降至 83.74%但 final MAE/SAE 改善至 273.15 W/7.92%，且消除了 val/test 标签泄漏，故固化 E4 的结构修复；E2 证明冻结旧泄漏 manifest 无益；raw 是跨 val/test/inference 更稳健层，L4 的 val 优势是同集拟合乐观偏差，L5 同源混合无稳定价值；E4 validation 拟合的有界系数 1.1159627 虽使独立 test SAE 8.41%→2.21%，但共同 inference 仍由 ON -46.47 kWh 与 OFF +58.47 kWh 抵消，因此不接入生产；E3 高功率标签显著改善高档预测和 MAE，但固定 test F1 降至 88.03%，朴素混入不通过。
+- 未决问题：所有共同 holdout 方案的阈值扫描 F1 上限仍约 84.5%，未达到 90%；需自动持久化 split manifest、实现 Stage-1 全量 train/Stage-2 train-ON 双视图、标准化 ON/OFF 分项指标；高功率标签下一轮只能进入 Stage-2，并比较分桶重加权、稳健损失或独立高功率专家；L4/乘性校正需拆分 calibration/selection fold 或交叉拟合。
+- 相关文件/分支：`scripts/03_train.py`、`scripts/test_fixed_top_cols.py`、`REPORT_TEST.md`、`STATUS.md`、`artifacts/validation_0789_opt_*`、分支 `arena/019ff3f3-nilm-test`。

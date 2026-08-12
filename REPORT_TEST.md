@@ -557,3 +557,127 @@ B 的 L4 训练残差均值已达 +199 W，但校正量被限幅在 ±150 W，�
 5. 对每组做多随机种子和“追加 1 个 OFF 日”扰动测试，检查 split/特征清单是否保持稳定。
 
 主指标应同时满足：F1≥90%、SAE≤20%，并额外要求 ON 能耗偏差、OFF 虚假能耗分别受控；禁止仅凭净 SAE 的正负抵消通过。当前最合理的短期基线是 C 固定切分，而非 A 的误差抵消模型，也不是 B 的重排 split 模型。
+
+---
+
+## [2026-08-12] 专题：0789 固定 holdout 优化验证（特征隔离、层选择、乘性校正与高功率 P2）
+- 类型：验证专题 / 用户专题
+- 目标与假设：在用户 `800080270789_4206680982373` 的固定 20/6/6 日 train/val/test 上，实际验证上一专题提出的 hard-negative 保留、特征隔离、raw/L4/L5 选择、有界 Stage-2 乘性校正和 7 月高功率标签方案；固定 test 与共同推理日不参与任何校正系数拟合。
+- 是否进入 REPORT.md（稳定结论）：否；本轮得到结构性代码修复和明确消融结论，但共同推理 F1 仍低于 90%，乘性校正也仍存在 ON 少估与 OFF 虚假能耗抵消，尚不能宣布为推荐稳定版本。
+
+### 1. 可复现实验矩阵
+
+所有模型均以固定随机种子、`--force-retrain` 和隔离输出目录串行重训；E1/E2/E4 使用相同的 20/6/6 日 split，其中 train 明确保留 2026-06-05/06 两个 hard-negative 日，val/test 日期完全不变。共同推理比较固定为 22 天、2112 个 15 分钟点。
+
+| 实验 | 唯一变化 | 输出目录 | 结果 |
+|---|---|---|---|
+| E0 baseline replay | 原配置/原切分重放 | `artifacts/validation_0789_opt_baseline/` | 1/1 成功，109.2 s |
+| E1 fixed split | 固定 20/6/6 日，保留 06-05/06 hard negatives | `artifacts/validation_0789_opt_fixed_split/` | 1/1 成功，112.7 s |
+| E2 stale frozen manifest | E1 + 冻结 E0 的 Top-25 顺序 | `artifacts/validation_0789_opt_fixed_features/` | 1/1 成功，111.8 s |
+| E4 train-only features | E1 + Top-25 相关性和温度功率 LUT 仅在 train 拟合 | `artifacts/validation_0789_opt_train_features/` | 1/1 成功，112.9 s |
+| E3 high-power P2 | 固定 E1 特征，向 train 增加 2026-07-08~10，仍保留 07-11~15 holdout | `artifacts/validation_0789_opt_high_power/` | 1/1 成功，130.3 s |
+
+E2 的 `model_meta.json` 已核验 `feature_selection_source=fixed_manifest`；E4 已核验 `feature_selection_source=train_correlation`、`temp_power_lut_fit_source=train` 和 20 个 `feature_fit_dates` 均只来自固定 train。E1/E2/E4 的 Stage-2 train-ON 样本均固定为同一批 832 点（均值 922.8 W、中位 760.0 W），06-05/06 的新增 OFF 样本只增加 Stage-1 的负例，不会进入 ON 回归拟合；因此 E1→E2/E4 的变化可解释为特征/LUT视图变化，而不是 ON 标签换样。
+
+### 2. 固定共同推理日：split 和特征隔离消融
+
+下表均为相同 2112 点；回归列使用当时生产 `final`（L4+L5）输出。真实总能耗均为 290.010 kWh。
+
+| 实验 | Precision | Recall | F1 | TP/FP/FN | MAE | SAE | 预测能耗 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E0 baseline | 65.10% | 99.37% | 78.66% | 787/422/5 | 325.22 W | **1.14%** | 293.325 kWh |
+| E1 fixed split | **73.26%** | 98.61% | **84.07%** | 781/285/11 | 283.26 W | 11.15% | 257.668 kWh |
+| E2 冻结 E0 manifest | 73.13% | 98.61% | 83.98% | 781/287/11 | 285.67 W | 10.80% | 258.679 kWh |
+| E4 train-only selector/LUT | 72.63% | **98.86%** | 83.74% | 783/295/9 | **273.15 W** | 7.92% | 267.043 kWh |
+
+结论：
+
+1. E1 再次确认固定 split + hard negatives 是分类最有效的 P0：相对 E0，FP 减少 137，F1 提升 5.41pp，MAE 降低 41.96 W。
+2. 直接冻结旧 E0 的全量相关性 manifest（E2）没有收益：相对 E1，F1 -0.09pp、MAE +2.41 W，仅净 SAE改善 0.35pp。旧 manifest 本身含 val/test 标签信息，不能作为长期方案。
+3. E4 的 train-only 选择器是正确的泄漏修复：相对 E1 的 F1 小幅下降 0.33pp，但 final MAE 改善 10.11 W、SAE 改善 3.23pp。不能为了多 0.33pp F1 保留全量标签相关性泄漏。
+4. E0 的低 SAE 仍不可用于验收：final 在真实 ON 段只预测 212.00/285.28 kWh，在真实 OFF 段却预测 81.33/4.73 kWh，是两种大误差的抵消。
+
+E4 三层在真实 ON/OFF 段的预测能耗为：raw `214.00/56.63` kWh、L4 `211.85/51.60` kWh、L5 `212.93/54.12` kWh。虽然净 SAE 已低于 20%，ON 少估和 OFF 虚假能耗仍远未受控。
+
+### 3. 固定 validation 上比较 raw、L4、L5，并由独立 test 复核
+
+E4 的 validation 是 L4 的拟合集，因此 L4 的 validation 指标只能说明拟合能力，不能单独用于选型。L5 在本用户上没有独立 fallback：summer expert 与 fallback 同样本、同算法、同随机种子，故按推理时 ALERT 策略验证为 `0.5×raw + 0.5×L4` 的同源代理。fixed test 从未参与 L4 或层选择参数拟合。
+
+| 数据集 | 层 | MAE | SAE | 预测能耗 |
+|---|---|---:|---:|---:|
+| fixed validation（L4 拟合集） | raw | 193.74 W | 12.94% | 68.053 kWh |
+|  | L4 | **144.81 W** | **6.86%** | 72.806 kWh |
+|  | L5 同源 50/50 | 168.23 W | 9.90% | 70.430 kWh |
+| independent fixed test | raw | 198.97 W | **8.41%** | 67.450 kWh |
+|  | L4 | 202.33 W | 11.47% | 65.196 kWh |
+|  | L5 同源 50/50 | **198.45 W** | 9.94% | 66.323 kWh |
+| common inference | raw | 273.91 W | **6.68%** | 270.630 kWh |
+|  | L4 | 274.07 W | 9.16% | 263.456 kWh |
+|  | L5 final | **273.15 W** | 7.92% | 267.043 kWh |
+
+L4 在其拟合 validation 上 MAE 改善 48.93 W，却在独立 test 上恶化 3.36 W、SAE恶化 3.06pp，属于明显的同集拟合乐观偏差。L5 只在 test/inference 上取得 0.52/0.76 W 的极小 MAE变化，且 SAE 均比 raw 差；不足以证明同源混合值得保留。按跨集稳健性，本轮 raw 是首选层，后续若保留 L4，必须把 validation 再拆成 calibration/selection 或做交叉拟合。
+
+### 4. 只用 validation 拟合有界 Stage-2 乘性校正
+
+对 E4 raw 的非零 Stage-2 输出拟合无截距 L2 系数：
+
+`scale = clip(sum(pred * true) / sum(pred²), 0.85, 1.15) = 1.1159626982`
+
+系数只读取固定 validation；独立 fixed test 与共同 inference 完全不参与拟合。校正不改变 ON/OFF 状态，因此分类指标保持不变。
+
+| 数据集 | raw MAE → 缩放后 | raw SAE → 缩放后 | 缩放后能耗 |
+|---|---:|---:|---:|
+| fixed validation（拟合来源） | 193.74 → **183.18 W** | 12.94% → **2.85%** | 75.945 kWh |
+| independent fixed test | **198.97 → 201.10 W** | 8.41% → **2.21%** | 75.271 kWh |
+| common inference | 273.91 → **257.23 W** | 6.68% → **4.14%** | 302.013 kWh |
+
+独立 test 的 SAE 明显改善，但 MAE 反而增加 2.13 W；共同 inference 的 MAE 改善 16.67 W。更重要的是分项能量：
+
+| 数据集 | 真 ON：真实→缩放预测（偏差） | 真 OFF：真实→缩放预测（偏差） | 净偏差 |
+|---|---:|---:|---:|
+| fixed test | 72.192→74.385（+2.193）kWh | 1.450→0.886（-0.564）kWh | +1.629 kWh |
+| common inference | 285.282→238.816（**-46.466**）kWh | 4.728→63.197（**+58.469**）kWh | +12.003 kWh |
+
+因此该有界系数通过了“只用 val 拟合、独立 test SAE改善”的技术验证，却**未通过生产验收**：共同 inference 的 4.14% SAE 仍由 ON 少估和 OFF 虚假能耗抵消。它可保留为下一轮交叉拟合候选，不能以低净 SAE 直接上线。
+
+逐日上，E4 raw 在 22 个推理日中有 16 日命中 `F1<90% 或 SAE>20%`，有真实能耗的 15 日中命中 11 日；缩放后分别降到 12 日和 7 日。改善完全来自 SAE，分类 F1 不变。
+
+### 5. 高功率 P2 标签实验
+
+E3 把较早的 2026-07-08~10 三个有标签高功率日加入 train，并继续把 07-11~15 留作 holdout。为了避免特征结构变化混淆，E3 冻结 E1 的 Top-25。公平比较排除 07-08~10 后的共同 19 个推理日：
+
+| 模型（共同 19 日 final） | Precision | Recall | F1 | MAE | SAE | 预测/真实能耗 |
+|---|---:|---:|---:|---:|---:|---:|
+| E1 fixed split | 69.43% | 98.59% | **81.48%** | 284.22 W | **6.67%** | 215.624/231.028 kWh |
+| E3 + 07-08~10 | **69.53%** | 97.65% | 81.23% | **252.32 W** | 17.47% | 271.397/231.028 kWh |
+
+高功率标签显著缓解 P50 压缩：在真实 1400–2000 W 桶，final 均值由 1155.7 提升到 1544.7 W（真实 1662.3 W）；在 ≥2000 W 桶由 1304.3 提升到 1731.2 W（真实 2204.6 W）。但它同时把 60–600 W 桶从 423.2 推高到 456.6 W、600–1000 W 桶从 749.2 推高到 965.2 W，并使能耗从少估变成多估。
+
+独立 fixed test 的 raw F1 从 E1 的 96.46%跌到 E3 的 88.03%，SAE从 8.67%升到 20.42%；共同推理 F1 也小降 0.25pp。故“直接把三个高功率日混入统一 Stage-1/Stage-2”不通过验收。高功率标签是必要的，但下一步必须仅进入 Stage-2，并按功率桶/日期做权重控制或使用能表达高档的独立专家，不能同时扰动 Stage-1 阈值边界。
+
+### 6. 分类上限与最终验收
+
+在共同 22 天直接扫描阈值并使用同一后处理，E1 最佳 F1 为 84.55%（阈值 0.55），E4 最佳为 84.43%（阈值 0.49），均明显低于 90%。当前目标口径结果：
+
+- SAE≤20%：E1/E2/E4 和 E3 共同推理均可满足，但其中若干结果存在严重正负能量抵消，不能单独验收；
+- F1≥90%：所有固定 holdout 方案均未达到；
+- 总结：本轮 P0/P1 结构性修复有效，P2 高功率标签证明方向必要但朴素混入失败，整体**不通过 F1/分项能量联合验收**。
+
+剩余瓶颈分为两条：
+
+1. Stage-1：p3/p4 大负载与 p1+p2 ON 的总线特征高度重叠，阈值扫描上限仅约 84.5%；必须继续增加按干扰类型平衡的 hard negatives，或引入 p3/p4 nuisance-load 辅助状态/功率特征。
+2. Stage-2：共同 inference 的 ≥1400 W 真 ON 占比高，树模型和 P50 仍压缩高档；需要把高功率日只供 Stage-2 使用，并比较功率桶重加权、Huber/平方损失、独立高功率专家或单调分段校正。
+
+### 7. 本轮代码固化与遗留问题
+
+已在 `scripts/03_train.py` 固化：
+
+- 在特征工程前解析最终 split，默认仅用 `idx_tr` 计算 Top-25 相关性；
+- 温度功率 LUT 也只用 train 拟合，val/test 仅 transform；
+- 模型持久化 `feature_selection_source`、`feature_fit_dates`、`temp_power_lut_fit_source`；
+- 提供实验开关 `NILM_FIXED_TOP_COLS`，严格校验 JSON、非空字符串、重复和缺失列，并按 manifest 顺序冻结；
+- 新增 `scripts/test_fixed_top_cols.py`，2 个合法 + 7 个非法 manifest 用例通过。
+
+最终自包含回归为 141/141 断言通过（`test_fixed_top_cols` 1、`test_composite_target_col` 50、`test_batch_execution_state` 37、`test_min_w_column` 25、`test_daily_raw_counts` 28），`py_compile` 与 `git diff --check` 通过。
+
+遗留问题：固定 split manifest 目前仍由用户配置显式提供，尚未自动持久化生成；Stage-1/Stage-2 尚未拥有完全独立的样本/特征视图；ON 能耗偏差和 OFF 虚假能耗尚未写入标准汇总 CSV；Stage-2 乘性校正仅做了离线有界验证，未接入生产 bundle。

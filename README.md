@@ -1919,8 +1919,11 @@ python scripts/run_user_pipeline.py \
 | `NILM_BASELINE_MODE=1` | v6.3 | 切换为 v4.2 基线训练模式 (跳过 L1/L4, 不覆盖主模型组件) |
 | `NILM_USER_GUARD_ENABLED=0/1/""` | **v13.1** | 用户级 D87 守卫开关 (由 run_user_pipeline.py 注入) |
 | `NILM_SPLITS_FILTER_SPEC=<json>` | **v13.2** | per-split 时段过滤规格 (由 run_user_pipeline.py 注入) |
+| `NILM_FIXED_TOP_COLS=<json-array>` | **2026-08-12** | 可复现实验开关：按给定顺序冻结电参量 Top-K；严格拒绝空数组、非字符串、重复列和缺失列。未设置时使用默认 train-only 选择 |
 
 数据源: `artifacts/aligned_15min.csv` (02 输出)
+
+**特征拟合隔离（2026-08-12 起）**：`03_train.py` 在特征工程前先解析最终 train/val/test（含 `NILM_SPLITS_FILTER_SPEC`），Top-25 标签相关性与温度功率 LUT 只在 train 上拟合，val/test 仅做 transform。bundle / `model_meta.json` 会保存 `feature_selection_source`、`feature_fit_dates` 和 `temp_power_lut_fit_source` 供审计；禁止再用全量 val/test 标签重选特征。
 
 #### C.3.3 `03b_train_v42_baseline.py` (v4.2 基线对照)
 

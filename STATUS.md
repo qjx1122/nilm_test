@@ -1,7 +1,7 @@
 # STATUS.md
 
 ## 当前目标
-- 已完成：针对用户 `800080270789_4206680982373` 增加 2026-06-05、06-06 全关训练日后指标变差的问题，完成固定切分反事实、确定性重放、分层能耗误差和代码路径因果分析，并给出分优先级优化方案。
+- 已完成：针对用户 `800080270789_4206680982373` 执行固定 holdout 优化验证，完成 frozen/train-only 特征、raw/L4/L5、有界 Stage-2 乘性校正和 7 月高功率标签消融；固化 train-only 特征选择/LUT 修复。联合验收仍未通过（共同推理最佳 F1 约 84.5% < 90%）。
 
 ## 已完成
 - [x] 2026-08-12 完成开局仪式、`.venv` 依赖恢复和 GitHub/远端检查。
@@ -17,15 +17,22 @@
 - [x] 重放原配置基线并核验训练、推理每日 CSV SHA-256 与原运行完全一致；完成 ON/OFF 能耗拆分，确认原 SAE 1.14% 是 ON 低估 -73.28 kWh 与 OFF 误报 +76.60 kWh 偶然抵消。
 - [x] 定位结构性原因：新增 OFF 日使 Top-3 相关性排名翻转并替换 16 个 Stage-2 派生特征；自动切分替换 104/101 个 ON 样本；P50 树模型对 ≥1400 W OOD 功率严重压缩；L4 ±150 W 和同源 fallback 的 L5 不能稳定修复。
 - [x] 在固定 val 上拟合候选乘性校正系数 1.1138；独立固定 test 的 raw SAE 8.67%→1.72%，共同推理 raw SAE 9.99%→0.25%、MAE 283.63→265.02 W。结论及实施顺序已追加到 `REPORT_TEST.md`。
+- [x] 完成 E0/E1/E2/E4 固定共同 2112 点消融：final F1 为 78.66%/84.07%/83.98%/83.74%，MAE 为 325.22/283.26/285.67/273.15 W，SAE 为 1.14%/11.15%/10.80%/7.92%。
+- [x] 核验冻结旧 E0 manifest 的 E2 无收益；实现并验证 E4 train-only Top-25 与 train-only 温度功率 LUT，模型元数据记录拟合来源和 20 个 train 日期。
+- [x] 在固定 validation/test/common inference 上完成 raw/L4/L5 比较：L4 在拟合 val 上 MAE 193.74→144.81 W，但独立 test 反向恶化到 202.33 W；同源 L5 也无稳定收益，raw 是跨集更稳健层。
+- [x] 仅用 E4 validation 拟合 `[0.85,1.15]` 有界乘数 1.1159627；test SAE 8.41%→2.21%但 MAE 198.97→201.10 W，共同 inference SAE 6.68%→4.14%、MAE 273.91→257.23 W；因 ON -46.47 kWh 与 OFF +58.47 kWh 仍抵消，未接入生产。
+- [x] 完成 E3 高功率 P2：07-08~10 加入 train 后，公平 19 日 final MAE 284.22→252.32 W，高功率桶显著改善；但 F1 81.48%→81.23%、SAE 6.67%→17.47%，固定 test F1 跌至 88.03%，故朴素混入不通过。
+- [x] 固化 `scripts/03_train.py` 的 train-only 特征/LUT 和严格 frozen manifest 开关；新增 `scripts/test_fixed_top_cols.py`。最终 141/141 自包含断言、编译和 diff 检查通过。
 
 ## 进行中
-- 无；本次原因分析与方案设计已固化，尚未按方案修改生产代码。
+- 无；本轮优化验证、代码固化和专题报告已完成。
 
 ## 下一步（TODO）
-1. P0：为 0789 配置持久化固定 split；保留全关 hard negative，但仅用于 Stage-1；以固定 val/test 选择 raw/L4/L5 并复验乘性校正。
-2. P1：实现追加不变的 split manifest、train-only 预处理、Stage-1/Stage-2 双特征选择器，以及 ON 偏差/OFF 虚假能耗分项指标。
-3. P2：补充 7 月 1400–2300 W 高功率标签，比较 P50、Huber/平方损失及 P50/P90 混合，目标同时达到 F1≥90%、SAE≤20%。
-4. 后续再处理用户 `800080270800_4200904302272` 的大量全关误报和推理 SAE 93.97%。
+1. P1：把固定 split 日期自动持久化为每用户 manifest，并将 Stage-1 全量 train 与 Stage-2 train-ON 的样本/特征视图彻底分离。
+2. P1：把 `ON_energy_bias_kWh`、`OFF_false_energy_kWh`、ON-only MAE 写入标准 train/test/inference 汇总；层校正需再拆 calibration/selection validation 或交叉拟合。
+3. P2：07-08~10 高功率标签只供 Stage-2，比较功率桶重加权、Huber/平方损失、独立高功率专家或单调分段校正，避免再次扰动 Stage-1 阈值。
+4. P2：继续增加按 p3/p4 干扰类型平衡的 hard negatives，或引入 nuisance-load 辅助模型；当前阈值扫描 F1 上限约 84.5%，单纯调阈值无法达到 90%。
+5. 后续再处理用户 `800080270800_4200904302272` 的大量全关误报和推理 SAE 93.97%。
 
 ## 决策记录 / 踩坑
 - 本会话固定在 Arena 分支 `arena/019ff3f3-nilm-test`，不另建或切换分支（优先遵守会话运行环境约束）。
@@ -38,8 +45,12 @@
 - 0789 的原配置在共同推理日也存在同类抵消：真实 ON 低估 73.28 kWh、真实 OFF 误报多算 76.60 kWh，净 SAE 才呈现 1.14%。因此优化验收必须同时看 ON 能耗偏差和 OFF 虚假能耗，不能只看净 SAE。
 - 06-05/06-06 是有效 hard negative：`p1+p2` 完整全零，但 p3/p4 分别消耗 5.62/13.10 与 7.51/8.61 kWh，总线信号接近真实 ON；应保留给分类器，而不是混入 Stage-2 特征选择和 ON 回归数据视图。
 - 固定 split 反事实是本次核心决策：C 相比 B 在相同新增数据下只改变 split 归属，故 C→B 的 F1 -2.40pp、SAE +12.24pp、MAE +95.28 W 可归因于切分重排及其后续 Stage-2/L4 变化。
-- 当前相关性 Top-K 在 split 前用全量标签拟合，新增 OFF 日使相关性排名变化并替换 16 个 Top-3 派生特征，存在标签泄漏和增量不稳定；后续必须改为 train-only，并为 Stage-2 使用 ON-only/冻结特征清单。
-- 当前 L5 fallback 与 summer expert 在此用户上同源同算法（全部训练样本均为 summer），不构成真正模型多样性；严重漂移时 0.5 混合只会折中 raw 与 L4，B 上将 SAE 20.15%拉回 23.39%。
+- 当前相关性 Top-K 在 split 前用全量标签拟合，新增 OFF 日使相关性排名变化并替换 16 个 Top-3 派生特征，存在标签泄漏和增量不稳定；本轮已改为先解析最终 split，再仅用 train 拟合 Top-25 和温度功率 LUT。Stage-2 ON-only 选择器仍待实现。
+- 不能把旧全量相关性 manifest 当成正确答案：E2 冻结 E0 特征后 F1/MAE 均比 E1 略差。保留 frozen manifest 能力是为了可复现实验；默认生产路径采用 train-only 动态选择并持久化结果。
+- 当前 L5 fallback 与 summer expert 在此用户上同源同算法（全部训练样本均为 summer），不构成真正模型多样性；E4 固定 val 的 50/50 代理位于 raw/L4 之间，独立 test/inference 仅改善 0.52/0.76 W MAE且 SAE 更差，不推荐据此启用同源混合。
+- L4 使用同一 validation 拟合和报告会产生明显乐观偏差：E4 val MAE 改善 48.93 W，但独立 test 恶化 3.36 W。后续层选择必须另设 selection fold 或交叉拟合。
+- 有界乘性校正只通过了独立 test 的净 SAE 验证，未通过 ON/OFF 分项验收；共同 inference 仍为 ON -46.47 kWh、OFF +58.47 kWh，故不接入 bundle。
+- 高功率标签方向必要但不能朴素混入统一训练：E3 高档预测显著改善，却使固定 test F1 降至 88.03%。下一轮高功率日只允许进入 Stage-2，并进行分桶权重控制。
 - 仓库没有 `setup.sh`，按 README / `requirements.txt` 使用 `.venv`。当前 Python 3.11.2 与 README 推荐 3.10 不同，固定依赖和现有自包含测试均通过。
 - `scripts/test_train_infer_symmetry.py` 硬编码依赖仓库外历史产物，当前缺失导致 `FileNotFoundError`，不判定为源码回归。
 
@@ -48,7 +59,9 @@
 - 两份配置：`data/time_filters-5User-v14-new.json`、`data/time_filters-5User-v14-new-test.json`
 - 修复代码/回归：`scripts/run_user_pipeline.py`、`scripts/test_composite_target_col.py`
 - 最终隔离产物：`artifacts/validation_v14_new/`、`artifacts/validation_v14_new_test/`
-- 0789 因果实验：`artifacts/analysis_0789_fixed_split_alloff/`、`artifacts/analysis_0789_baseline_replay/`
+- 0789 因果实验（历史）：`artifacts/analysis_0789_fixed_split_alloff/`、`artifacts/analysis_0789_baseline_replay/`
+- 0789 本轮优化实验：`artifacts/validation_0789_opt_baseline/`、`validation_0789_opt_fixed_split/`、`validation_0789_opt_fixed_features/`、`validation_0789_opt_train_features/`、`validation_0789_opt_high_power/`
+- 本轮代码：`scripts/03_train.py`、`scripts/test_fixed_top_cols.py`
 - 最终批量日志：`logs/_batch/batch_run_20260812_033731.log`、`logs/_batch/batch_run_20260812_034712.log`
 - 因果实验日志：`logs/_batch/batch_run_20260812_041238.log`、`logs/_batch/batch_run_20260812_041533.log`
 - 会话纪要：`session/NILM_AC_session_complete.md`
