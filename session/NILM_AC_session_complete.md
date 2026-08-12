@@ -6123,3 +6123,10 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 ---
 
 *会话导出更新时间: 2026-07-23 (v13.17 run_batch_users 断点续跑 + --resume + 状态 CSV 实时增量写 + cleanup 白名单关键 bug 修复 + 37 单测全通过)*
+
+## [2026-08-12] 会话纪要
+- 目标：读取 `BOOTSTRAP.md`，执行开局恢复流程，并建立后续会话可持续的状态基线。
+- 完成项：确认分支 `arena/019ff3f3-nilm-test` 与干净工作区；读取 README、历史纪要和专题报告；确认 GitHub/远端连接正常；新建 `.venv` 并安装 `requirements.txt`；完成 compileall、137 个自包含断言、time_filter_utils 自测及 v6.15 守卫压力脚本验证；首次创建 `STATUS.md`。
+- 关键决策：仓库无 `setup.sh` 且非 pnpm 项目，采用 README 的 pip 备选流程；固定使用 Arena 会话分支，不按 BOOTSTRAP 的通用分支建议另建分支；将 Python 3.11 与 README 推荐 3.10 的差异记录到 STATUS。
+- 未决问题：尚未收到具体开发任务；`scripts/test_train_infer_symmetry.py` 依赖仓库外 `/home/user/nilm_ac_win/results_v6_15_0` 历史实验产物，当前只能标记为外部数据缺失，不能执行完成。
+- 相关文件/分支：`STATUS.md`、`session/NILM_AC_session_complete.md`、分支 `arena/019ff3f3-nilm-test`。
