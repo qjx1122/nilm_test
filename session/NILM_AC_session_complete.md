@@ -6130,3 +6130,10 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 - 关键决策：仓库无 `setup.sh` 且非 pnpm 项目，采用 README 的 pip 备选流程；固定使用 Arena 会话分支，不按 BOOTSTRAP 的通用分支建议另建分支；将 Python 3.11 与 README 推荐 3.10 的差异记录到 STATUS。
 - 未决问题：尚未收到具体开发任务；`scripts/test_train_infer_symmetry.py` 依赖仓库外 `/home/user/nilm_ac_win/results_v6_15_0` 历史实验产物，当前只能标记为外部数据缺失，不能执行完成。
 - 相关文件/分支：`STATUS.md`、`session/NILM_AC_session_complete.md`、分支 `arena/019ff3f3-nilm-test`。
+
+## [2026-08-12] 会话纪要
+- 目标：分别使用 `time_filters-5User-v14-new.json` 与 `time_filters-5User-v14-new-test.json` 对 5 用户执行隔离、强制重训验证，筛选并逐日分析所有 `F1 < 90%` 或 `SAE > 20%` 的记录，比较目标用户及总体变化。
+- 完成项：两套修正后批量运行分别耗时 579.8 秒和 589.0 秒，均 5/5 成功、0 软跳过、0 失败；核验未变化 4 用户每日产物逐字节一致；完成 636 个用户日指标筛选和 236 个原始命中行的逐日指标/覆盖/混淆/能耗归因；将完整方法、总体/目标用户对比和全部日期表追加到 `REPORT_TEST.md`；最终 4 个自包含测试脚本共 140/140 断言、time_filter_utils 自测、守卫压力测试、compileall 和 diff 检查通过。
+- 关键决策：首次预跑发现未变化用户 `800080252844_4206894986488` 的第二套结果异常，未因 exit 0 直接采信；定位到 `common.py` 同秒等长改写造成旧 pyc 误读目标列，修复缓存清理、增加组合目标替换校验与子进程回归后，删除预跑产物并完整重跑。每日 `TP=FP=FN=0` 的 F1=0 记录保留但标记为“不适用”，不计模型失败。目标用户测试配置只判定为分类改善、能耗回归退化，不推荐直接替换原配置。
+- 未决问题：目标用户需在固定日期切分下修复 Stage-2 功率低估；用户 `800080270800_4200904302272` 仍有大量全关误报且推理 F1/SAE 为 58.95%/93.97%；指标层建议增加 `f1_applicable` 或将无正类日 F1 输出为 N/A。
+- 相关文件/分支：`REPORT_TEST.md`、`STATUS.md`、`scripts/run_user_pipeline.py`、`scripts/test_composite_target_col.py`、`artifacts/validation_v14_new/`、`artifacts/validation_v14_new_test/`、分支 `arena/019ff3f3-nilm-test`。
