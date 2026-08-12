@@ -336,6 +336,61 @@ finally:
 
 
 # ============================================================
+# T7. run_user_pipeline TARGET_COL 源码补丁的子进程缓存一致性
+# ============================================================
+print()
+print("=" * 70)
+print(" T7. patch_common: 同秒等长改写后子进程不得复用旧 pyc")
+print("=" * 70)
+
+import py_compile
+import re
+import subprocess
+from run_user_pipeline import patch_common, restore_common
+
+common_path = Path(__file__).resolve().parent / "common.py"
+common_original = common_path.read_text(encoding="utf-8")
+match_original = re.search(r'TARGET_COL\s*=\s*"([^"]+)"', common_original)
+original_target_on_disk = match_original.group(1) if match_original else None
+
+try:
+    # 先生成指向默认 p1 的有效 pyc，再立刻做 p1 -> p2 等长改写，复现时间戳缓存风险。
+    py_compile.compile(str(common_path), doraise=True)
+    patch_common("p2")
+    child_target = subprocess.check_output(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, 'scripts'); import common; print(common.TARGET_COL)"],
+        cwd=str(common_path.parent.parent), text=True,
+    ).strip()
+    check(child_target == "p2",
+          f"T7.1 等长补丁后新子进程读取 p2 (实际 {child_target!r})")
+
+    restore_common()
+    restored_target = subprocess.check_output(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, 'scripts'); import common; print(common.TARGET_COL)"],
+        cwd=str(common_path.parent.parent), text=True,
+    ).strip()
+    check(restored_target == original_target_on_disk,
+          f"T7.2 恢复后新子进程读取 {original_target_on_disk!r} "
+          f"(实际 {restored_target!r})")
+
+    patch_common("p1+p2")
+    composite_target = subprocess.check_output(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, 'scripts'); import common; print(common.TARGET_COL)"],
+        cwd=str(common_path.parent.parent), text=True,
+    ).strip()
+    check(composite_target == "p1+p2",
+          f"T7.3 组合目标补丁后新子进程读取 p1+p2 (实际 {composite_target!r})")
+finally:
+    restore_common()
+    # 即使被测恢复逻辑异常，也保证测试不会把仓库 common.py 留在补丁状态。
+    if common_path.read_text(encoding="utf-8") != common_original:
+        common_path.write_text(common_original, encoding="utf-8")
+
+
+# ============================================================
 # 汇总
 # ============================================================
 print()
