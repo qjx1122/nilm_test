@@ -116,6 +116,25 @@ if _os.environ.get("NILM_BASELINE_MODE") == "1":
     USE_RESIDUAL_CALIB = False  # 基线模式不带残差校正
 
 
+def parse_fixed_top_cols(raw, available_cols):
+    """解析并严格校验可复现实验使用的冻结特征 manifest。"""
+    try:
+        cols = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"NILM_FIXED_TOP_COLS 必须为 JSON 字符串数组: {exc}") from exc
+    if not isinstance(cols, list) or not cols:
+        raise ValueError("NILM_FIXED_TOP_COLS 必须为非空 JSON 字符串数组")
+    if not all(isinstance(c, str) and c.strip() for c in cols):
+        raise ValueError("NILM_FIXED_TOP_COLS 每一项必须为非空字符串")
+    cols = [c.strip() for c in cols]
+    if len(cols) != len(set(cols)):
+        raise ValueError("NILM_FIXED_TOP_COLS 不允许重复列")
+    missing = [c for c in cols if c not in available_cols]
+    if missing:
+        raise ValueError(f"NILM_FIXED_TOP_COLS 含不存在的电参量列: {missing}")
+    return cols
+
+
 def main():
     # ============================================================
     # [v13.5] 用户级 common 常量覆盖 (env vars 由 run_user_pipeline.py 注入)
@@ -261,20 +280,74 @@ def main():
                      f"温度范围 [{weather_df['temperature_2m'].min():.1f}, "
                      f"{weather_df['temperature_2m'].max():.1f}] °C")
 
-    # ---------- 2b. 特征工程 (v6: 含漂移感知) ----------
-    with Timer("特征工程 v6 (相关性+差分+滚动+滞后+时间+温度+漂移)", log):
-        corr = df[feat_cols_all].corrwith(df["y_ac"]).abs() \
-                                .sort_values(ascending=False)
-        top_cols = corr.head(25).index.tolist()
-        log.info(f"  Top-25 相关性列, 例: {top_cols[:5]} ...")
-        
-        # v6: 构造温度-功率 LUT (训练阶段保存, 推理阶段复用)
+    # ---------- 2b. 提前解析切分，仅用 train 拟合特征选择/LUT ----------
+    # 特征仍对全量样本变换；任何依赖 y 或经验分布的拟合只能看到 train。
+    split_ratios = validate_split_ratios(SPLIT_RATIOS)
+    sp = make_splits(df.index, strategy=SPLIT_STRATEGY, ratios=split_ratios)
+    idx_tr, idx_va, idx_te = sp["train"], sp["val"], sp["test"]
+    _splits_filter_spec_str = _os.environ.get("NILM_SPLITS_FILTER_SPEC", "").strip()
+    _splits_spec = None
+    if _splits_filter_spec_str:
+        try:
+            from time_filter_utils import cli_arg_to_splits_spec, apply_per_split_filter
+            _splits_spec = cli_arg_to_splits_spec(_splits_filter_spec_str)
+            if _splits_spec is not None:
+                idx_tr, idx_va, idx_te = apply_per_split_filter(
+                    df.index, idx_tr, idx_va, idx_te,
+                    _splits_spec, logger=log
+                )
+        except Exception as _e:
+            log.warning(f"  [v13 per-split filter] 应用失败 ({_e}), 使用原切分")
+
+    # ---------- [v6.12.6+v6.15.0-graceful-v5] 数据质量门 3: 切分为空 ----------
+    # 触发条件: 对齐样本太少时任一 split 为空；须在 train-only 特征拟合前拦截。
+    # 退出码 13 -> 软跳过
+    if len(idx_tr) == 0 or len(idx_va) == 0 or len(idx_te) == 0:
+        log.warning("=" * 70)
+        log.warning(f"[SKIP] 数据质量门 3 触发: 切分后训练集、验证集或测试集为空")
+        log.warning(f"[SKIP] 跳过原因: split_empty_val_test")
+        log.warning(f"[SKIP] 详情: train={len(idx_tr)} / val={len(idx_va)} / test={len(idx_te)}, "
+                    f"对齐 {len(df)} 条 (~{len(df)/96:.1f} 天) 数据不足以做时序切分")
+        log.warning(f"[SKIP] 该用户的训练流水线已提前终止 (退出码 13)")
+        log.warning("=" * 70)
+        skip_info = {"skip_reason": "split_empty_val_test",
+                     "detail": (f"aligned_n={len(df)}, train_n={len(idx_tr)}, "
+                                f"val_n={len(idx_va)}, test_n={len(idx_te)}"),
+                     "aligned_n": int(len(df)),
+                     "train_n": int(len(idx_tr)),
+                     "val_n":   int(len(idx_va)),
+                     "test_n":  int(len(idx_te))}
+        (ARTIFACT_DIR / "skip_reason.json").write_text(
+            json.dumps(skip_info, ensure_ascii=False), encoding="utf-8")
+        sys.exit(13)
+
+    # ---------- 2c. 特征工程 (v6: 含漂移感知) ----------
+    with Timer("特征工程 v6 (train相关性+差分+滚动+滞后+时间+温度+漂移)", log):
+        corr = df.iloc[idx_tr][feat_cols_all].corrwith(df.iloc[idx_tr]["y_ac"]).abs() \
+                                           .sort_values(ascending=False)
+        # [v14.1] 可从已审计 manifest 冻结 Top-K 顺序，避免追加 OFF 日使
+        # 第 3/4 名翻转后连带替换大量 Top-3 派生特征；默认仅按 train 选择。
+        _fixed_top_cols_raw = _os.environ.get("NILM_FIXED_TOP_COLS", "").strip()
+        _feature_selection_source = "train_correlation"
+        if _fixed_top_cols_raw:
+            top_cols = parse_fixed_top_cols(_fixed_top_cols_raw, feat_cols_all)
+            _feature_selection_source = "fixed_manifest"
+            log.info(f"  Top-{len(top_cols)} 使用冻结 manifest, 例: {top_cols[:5]} ...")
+        else:
+            top_cols = corr.head(25).index.tolist()
+            log.info(f"  Top-25 仅按 train 相关性选择, 例: {top_cols[:5]} ...")
+
+        _feature_fit_dates = sorted({
+            str(d) for d in pd.to_datetime(df.index[idx_tr]).normalize().date
+        })
+
+        # v6: 构造温度-功率 LUT (仅按 train 拟合，推理阶段复用)
         # v13.15: 同步导出 temp_power_lut.csv, 便于事后审计与漂移对比
         temp_power_lut = None
         temp_power_lut_meta = None
         if USE_DRIFT_FEATURES and weather_df is not None:
             temp_power_lut, temp_power_lut_meta = build_temp_power_lut(
-                df, weather_df, top_cols, return_meta=True)
+                df.iloc[idx_tr], weather_df, top_cols, return_meta=True)
             n_bins = len([k for k in temp_power_lut if isinstance(k, tuple)])
             log.info(f"  [v6] 温度-功率 LUT 构造完成: {n_bins} 个桶, "
                      f"全局中位={temp_power_lut.get('__global_median__', 0):.1f}")
@@ -359,36 +432,19 @@ def main():
         log.info(f"    全量样本中 {sea:<11}: {n:>5} 条 ({n/len(df)*100:.1f}%)")
 
     # ---------- 3. 数据集切分 ----------
-    # 数据集切分 (从 common.py 集中读取配置)
-    split_ratios = validate_split_ratios(SPLIT_RATIOS)
+    # idx_tr/idx_va/idx_te 已在特征工程前解析，确保选择器和 LUT 仅按 train 拟合。
     log.info(f"切分策略: {SPLIT_STRATEGY}, "
              f"比例: train={split_ratios[0]:.0%} / "
              f"val={split_ratios[1]:.0%} / "
              f"test={split_ratios[2]:.0%}")
-    sp = make_splits(df.index, strategy=SPLIT_STRATEGY, ratios=split_ratios)
-    idx_tr, idx_va, idx_te = sp["train"], sp["val"], sp["test"]
-    # v6.10: stratified_day 会附带切分元数据 (完整天数/碎片天数/seed)
     if "_meta" in sp:
         meta = sp["_meta"]
         log.info(f"  [v6.10] 切分元数据: 完整天={meta['n_full_days']} "
                  f"碎片天={meta['n_partial_days']} (阈值={meta['full_day_threshold']} 条/天)  "
                  f"seed={meta['seed']}")
-
-    # [v13 per-split time_filter] 应用 train/val/test 独立 include/exclude
-    # 环境变量 NILM_SPLITS_FILTER_SPEC 由 run_user_pipeline.py 从批量配置注入
-    _splits_filter_spec_str = _os.environ.get("NILM_SPLITS_FILTER_SPEC", "").strip()
-    if _splits_filter_spec_str:
-        try:
-            from time_filter_utils import cli_arg_to_splits_spec, apply_per_split_filter, splits_spec_summary
-            _splits_spec = cli_arg_to_splits_spec(_splits_filter_spec_str)
-            if _splits_spec is not None:
-                log.info(f"  [v13 per-split filter] 规格: {splits_spec_summary(_splits_spec)}")
-                idx_tr, idx_va, idx_te = apply_per_split_filter(
-                    df.index, idx_tr, idx_va, idx_te,
-                    _splits_spec, logger=log
-                )
-        except Exception as _e:
-            log.warning(f"  [v13 per-split filter] 应用失败 ({_e}), 使用原切分")
+    if _splits_filter_spec_str and _splits_spec is not None:
+        from time_filter_utils import splits_spec_summary
+        log.info(f"  [v13 per-split filter] 规格: {splits_spec_summary(_splits_spec)}")
     log.info(f"数据集切分结果 (策略={SPLIT_STRATEGY}):")
     # [v13.8] 收集 train/val/test 实际使用的自然日集合, 用于 05 推理时检测数据泄漏
     # 存 ISO 日期字符串 (yyyy-mm-dd), 便于 JSON/joblib 序列化和跨环境比对
@@ -408,28 +464,6 @@ def main():
         mc = pd.to_datetime(ts).to_period("M").value_counts().sort_index()
         log.info(f"        月份分布: " +
                  ", ".join([f"{str(k)}={v}" for k, v in mc.items()]))
-
-    # ---------- [v6.12.6+v6.15.0-graceful-v5] 数据质量门 3: 切分后 val/test 为空 ----------
-    # 触发条件: 对齐样本太少时 stratified_day 全塞 train -> val/test 空 -> scaler.transform 崩
-    # 退出码 13 -> 软跳过
-    if len(idx_va) == 0 or len(idx_te) == 0:
-        log.warning("=" * 70)
-        log.warning(f"[SKIP] 数据质量门 3 触发: 切分后验证集或测试集为空")
-        log.warning(f"[SKIP] 跳过原因: split_empty_val_test")
-        log.warning(f"[SKIP] 详情: train={len(idx_tr)} / val={len(idx_va)} / test={len(idx_te)}, "
-                    f"对齐 {len(df)} 条 (~{len(df)/96:.1f} 天) 数据不足以做时序切分")
-        log.warning(f"[SKIP] 该用户的训练流水线已提前终止 (退出码 13)")
-        log.warning("=" * 70)
-        skip_info = {"skip_reason": "split_empty_val_test",
-                     "detail": (f"aligned_n={len(df)}, train_n={len(idx_tr)}, "
-                                f"val_n={len(idx_va)}, test_n={len(idx_te)}"),
-                     "aligned_n": int(len(df)),
-                     "train_n": int(len(idx_tr)),
-                     "val_n":   int(len(idx_va)),
-                     "test_n":  int(len(idx_te))}
-        (ARTIFACT_DIR / "skip_reason.json").write_text(
-            json.dumps(skip_info, ensure_ascii=False), encoding="utf-8")
-        sys.exit(13)
 
     X_tr, X_va = X[idx_tr], X[idx_va]
     y_tr, y_va = y[idx_tr], y[idx_va]
@@ -1026,6 +1060,9 @@ def main():
         "reg_high": reg_global_high,
         "feat_cols": top_cols,
         "feat_names": feat_names,
+        "feature_selection_source": _feature_selection_source,
+        "feature_fit_dates": _feature_fit_dates,
+        "temp_power_lut_fit_source": "train",
         "best_thr": best_thr,
         "ON_THR": ON_THR_W,                       # 兼容旧推理代码 (= ON_THR_TRAIN_W)
         "ON_THR_TRAIN": ON_THR_TRAIN_W,           # v6.13: 训练标签阈值
