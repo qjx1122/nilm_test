@@ -6139,3 +6139,19 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
 - 相关文件/分支：
   - 分支：`arena/019ff4a0-nilm-test`
   - 关键文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
+
+
+---
+
+## [2026-08-12] 会话纪要（通用抽象架构·增补全切分集预测文件产物规范）
+- 目标：按照用户关于“抽象算法方案私有内容、专注通用数据输入输出和配置框架，并在产物分类体系中完备增加 `train_pred.csv`、`val_pred.csv`、`test_pred.csv`、`train_pred_rf.csv`、`val_pred_rf.csv`、`test_pred_rf.csv`”的指示，进一步精合与重构说明书文档。
+- 完成项：
+  1. 在 `REPORT_TEST.md` 的 **3.1 产物目录分类体系**中，对 `artifacts/trains/<user_id>/` 下输出的 6 个核心分切集预测文件进行完整增补与定位说明。
+  2. 在 **3.3 通用多层级与多数据集预测产物表**中新增专项子小节，全面剖析主回归/分类建模流程及参考对照模型（Baseline RF）在 `train`、`val` 和 `test` 三集预测文件的具体生成逻辑与标准字段结构（`time`, `y_true_W`, `y_pred_W`, `residual_W` 及后处理校正等）。
+  3. 持续保持文档对于数据架构抽象与通用特征处理（如正规匹配、`pA+pB` 复合目标累加、25 列每日监控审计、段级表与 9 列原子状态持久化）、六大配置解析层级和安全契约（`_CLEANUP_WHITELIST` / `WARN+Fallback`）的完备覆盖。
+  4. 遵照 BOOTSTRAP.md 要求完成了 `STATUS.md` 与会话纪要及产物交付同步。
+- 关键决策：严格遵守文档治理纪律，将全员评估与全部子集预测明细标准完备统一至通用规范说明文档中。
+- 未决问题：无。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 关键文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
