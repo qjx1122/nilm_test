@@ -6187,3 +6187,20 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
   - 分支：`arena/019ff4a0-nilm-test`
   - 关键交付文件：`项目技术方案说明书_数据架构与核心算法全景规范.docx`
   - 关键状态文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
+
+
+---
+
+## [2026-08-12] 会话纪要（修改技术方案说明 Word 文档：抽象私有算法，保留通用框架架构）
+- 目标：按照用户指示，修改《项目技术方案说明书_数据架构与核心算法全景规范.docx》，抽象核心算法相关私有内容，只保留项目整体结构、数据输入输出和数据配置结构及通用算法输出相关内容。
+- 完成项：
+  1. 重构了排版生成脚本 `scripts/generate_tech_spec_docx.py`，把原有特定领域的专业物理概念与特定推导公式等算法私有细节完全抽离。
+  2. 重新覆盖生成了交付件 `/home/user/nilm_test/项目技术方案说明书_数据架构与核心算法全景规范.docx` (51,162 字节)，完整聚焦三大通用架构篇章：第 1 章 项目整体结构与二层解耦调度控制模型、第 2 章 通用数据输入与用户配置规范框架、第 3 章 通用算法输出产物体系与标准表结构全集。
+  3. 严格规范了 6 大切分集预测明细表 (`train_pred.csv`, `val_pred.csv`, `test_pred.csv`, `train_pred_rf.csv`, `val_pred_rf.csv`, `test_pred_rf.csv`)、25 列逐日指标及原始密度监控表、断点续跑 9 列状态表和集中式 JSON 六大核心模块的技术要求说明。
+  4. 按照 BOOTSTRAP.md 约束，同步在 `REPORT_TEST.md` 与 `STATUS.md` 中记录了 Word 交付件重构与同步的状态。
+- 关键决策：保证生成的技术方案说明书能够无缝适用于各类跨项目、跨场景的时序多任务学习及预测系统架构白皮书需求。
+- 未决问题：无。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 关键交付件：`项目技术方案说明书_数据架构与核心算法全景规范.docx`
+  - 关键状态文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
