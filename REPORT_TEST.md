@@ -681,3 +681,55 @@ E3 把较早的 2026-07-08~10 三个有标签高功率日加入 train，并继�
 最终自包含回归为 141/141 断言通过（`test_fixed_top_cols` 1、`test_composite_target_col` 50、`test_batch_execution_state` 37、`test_min_w_column` 25、`test_daily_raw_counts` 28），`py_compile` 与 `git diff --check` 通过。
 
 遗留问题：固定 split manifest 目前仍由用户配置显式提供，尚未自动持久化生成；Stage-1/Stage-2 尚未拥有完全独立的样本/特征视图；ON 能耗偏差和 OFF 虚假能耗尚未写入标准汇总 CSV；Stage-2 乘性校正仅做了离线有界验证，未接入生产 bundle。
+
+
+## [2026-08-12] 专题：0789 Stage-1/Stage-2 双视图、干扰负样本与无抵消校正验收
+- 类型：用户专题 / 实验专题 / 验证专题
+- 目标与假设：针对用户 `800080270789_4206680982373`，验证高功率标签只进入 Stage-2 是否能在不改变 Stage-1 分类边界的前提下改善功率回归；验证 p3/p4 hard negatives 或总线侧 nuisance 辅助模型能否改善共同 inference 分类；校正层必须按独立 validation 自然日交叉拟合选型，并以 F1、Precision、Recall、MAE、净 SAE、ON 能耗偏差、OFF 虚假能耗联合验收。
+- 方法 / 数据 / 参数：
+  - 固定原 20/6/6 个自然日 train/val/test，不改变 6 日 fixed test；共同 inference 基线为 22 日。test 和共同 inference 均不参与训练、特征选择、阈值选择、校正拟合或选层。
+  - `03_train.py` 将 Stage-1 和 Stage-2 拆为独立样本、独立 Top-K manifest、独立温度功率 LUT 和独立 scaler。Stage-1 在其 train 样本上按目标功率相关性选择；Stage-2 只在 train-ON 上选择。`04_evaluate.py`、`05_inference.py` 按 bundle 的两套 manifest 对称重建特征；旧 bundle 自动兼容共享视图。
+  - `NILM_STAGE2_ONLY_DATES=[2026-07-08,09,10]`：三天锚定 train，但从 Stage-1 样本、特征和阈值学习中完全排除，只向 Stage-2 提供 ON 标签；公平 inference 为排除这三天后的共同 19 日。
+  - p3/p4 hard-negative 消融使用共同 inference 中 `2026-06-07/11/14/16` 四天，只作为诊断，公平比较统一排除这四天。另实现 `NILM_ENABLE_NUISANCE_AUX=1`：从固定 train 的非目标分路生成 nuisance 标签，训练只消费总线特征的辅助分类器，抑制强度 `alpha` 只由 fixed validation 选择，允许自动回退为 0；推理绝不读取 p3/p4 真值。
+  - Stage-2 raw/scale/L4 按 6 个 validation 自然日留一交叉拟合。候选须满足 SAE≤20%、|ON 能耗偏差|≤20%、OFF 虚假能耗相对 raw 不显著增加，并在逐日 MAE 和 ON 偏差上达到严格多数胜出；最后才按 `MAE_W + abs(mean_bias_W)` 排序。fold 明细、门限和稳定候选写入 `model_meta.json`。
+  - 标准长表及 `summary_metrics_all_users.csv` 新增 `ON_kWh_true/ON_kWh_pred/ON_kWh_err/ON_energy_bias/OFF_false_kWh`，不再允许以正负抵消后的净 SAE 单独验收。
+- 结果 / 结论：
+
+### 1. 双视图基线与 Stage-2-only 高功率标签
+
+| 固定口径 | 模型层 | Precision | Recall | F1 | MAE | 净 SAE | ON 能耗偏差 | OFF 虚假能耗 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| fixed test 6 日 | 双视图基线 raw | 94.36% | 98.05% | 96.17% | 192.98 W | 0.24% | +0.244 kWh / +0.34% | 1.026 kWh |
+| fixed test 6 日 | **Stage-2-only final raw** | **94.36%** | **98.05%** | **96.17%** | **184.52 W** | **0.70%** | **+0.924 kWh / +1.28%** | **1.039 kWh** |
+| 公平 inference 19 日 | 双视图基线 raw | 68.78% | 98.75% | 81.08% | 302.29 W | **5.37%** | -66.723 kWh / **-29.35%** | 58.025 kWh |
+| 公平 inference 19 日 | **Stage-2-only final raw** | **68.78%** | **98.75%** | **81.08%** | **258.12 W** | 14.18% | **-25.571 kWh / -11.25%** | 62.041 kWh |
+
+Stage-1 的 Precision/Recall/F1 在 baseline 与 Stage-2-only 公平 19 日上逐项完全一致，证明高功率标签没有扰动 Stage-1 样本、特征或阈值。Stage-2-only 使 inference MAE 改善 44.18 W，ON 少估比例改善 18.10pp；fixed test MAE也改善 8.45 W。净 SAE由 5.37%变为14.18%并非退化到不可接受，而是原 baseline 的 -66.72 kWh ON 少估被 58.03 kWh OFF 虚假预测严重抵消；最终 raw 暴露并显著减轻了 ON 少估，净 SAE仍低于20%。
+
+### 2. p3/p4 hard negatives 与 nuisance 辅助模型
+
+| 公平口径 | 原双视图基线 F1 | 候选 F1 | TP/FP/FN | 结论 |
+|---|---:|---:|---:|---|
+| 排除四个干扰日后的共同 18 日 | **88.6750%** | 动态 hard-negative **88.2518%** | 785/202/7 | -0.4232pp，不采纳 |
+| 同上，冻结基础 Stage-1 manifest | **88.6750%** | frozen hard-negative **87.8348%** | 787/213/5 | -0.8402pp，不采纳 |
+| 同时加 Stage-2 高功率日和四个 hard-negative 的共同 15 日 | **86.8966%** | combined **86.0054%** | 633/201/5 | -0.8912pp，不采纳 |
+| 完整共同 22 日 | **83.7433%** | nuisance 抑制 **83.7433%** | 783/295/9 | validation 自动选择 `alpha=0`，安全回退 |
+
+四个 hard-negative 日期来自共同 inference，加入 train 会缩小评估集，故这里只作诊断消融，不作为最终共同 inference 验收。动态和冻结特征两种路径均未改善 F1；combined 也失败。总线侧 nuisance 辅助模型只用固定 train 拟合，但 fixed validation 上任何正抑制强度都未优于 `alpha=0`，生产路由因此自动禁用抑制。该结果说明目前 p3/p4 与目标 ON 在可见总线特征上仍高度重叠，不能通过朴素增样或线性 nuisance 概率解决。
+
+### 3. 校正选层与最终 raw 路由
+
+Stage-2-only 的 validation 日期留一 OOF 结果：raw/scale/L4 的 MAE 分别为 `199.90/201.77/191.91 W`，净 SAE为 `13.98/4.32/12.88%`。scale 虽改善聚合净偏差，但只在 6 日中的 3 日取得≥1% MAE改善；L4 的 MAE/ON偏差也只各胜 3 日。严格多数门要求至少4日，故稳定候选只有 `raw`，最终 bundle 的 `selected_stage2_layer=raw`。整个拟合和选层只读取 validation；fixed test 和共同 inference 从未参与参数或层选择。
+
+该保守门避免了旧规则误选 scale：旧 Stage-2-only scale 在 fixed test 为 `193.63 W / 15.15% SAE`，在公平 inference 19 日恶化为 `276.97 W / 30.57% SAE`。最终 raw 为 `184.52/258.12 W`，且 inference SAE `14.18%`。当校正只在恰好一半日期胜出时，不再以聚合净 SAE的正负抵消优势上线。
+
+### 4. 最终验收
+
+最终可复现产物为 `artifacts/validation_0789_final_stage2_raw/`，当前 `models/800080270789_4206680982373/model_meta.json` 记录 Stage-1 20日、Stage-2 23日（含3个 Stage-2-only 高功率日）、双 manifest、6日 OOF fold 明细和最终 raw 路由。
+
+- fixed test：F1 `96.1661%`、Precision `94.3574%`、Recall `98.0456%`、MAE `184.522 W`、SAE `0.6974%`、ON 能耗偏差 `+1.2801%`、OFF 虚假能耗 `1.0395 kWh`，通过既定 F1/SAE门。
+- 公平共同 inference 19日：F1 `81.0811%`、Precision `68.7773%`、Recall `98.7461%`、MAE `258.116 W`、SAE `14.1793%`、ON 能耗偏差 `-11.2491%`、OFF 虚假能耗 `62.0411 kWh`。
+- 最终判断：Stage-2-only 与 raw 路由通过了“不得扰动 Stage-1”和回归/无抵消校正验证，但共同 inference 的 F1 仍低于90%，且 OFF 虚假能耗仍高，故**整体不通过最终生产联合验收**。不能用 fixed test 的96.17%或 inference 的14.18%净 SAE掩盖共同 inference 分类失败。
+
+- 是否进入 REPORT.md（稳定结论）：否；按本专题约束，新结果仅追加到 `REPORT_TEST.md`。稳定结论为：高功率标签只进 Stage-2 可在分类完全不变时显著改善高功率回归；校正必须按日期交叉拟合并用 ON/OFF 分项与严格多数稳定性门，当前用户应路由 raw；朴素 p3/p4 hard-negative 和 validation 选择的线性 nuisance 抑制均无分类收益。
+- 遗留问题：共同 inference F1 仍为81.08%，主要由286个 FP 导致；需要不依赖分路真值的更强非线性 nuisance/多任务表征或新增独立训练来源的干扰标签，且必须在新的、未参与训练的共同 holdout 上复核。不得继续从现有共同 inference 取日期训练后再把缩小的剩余日期声称为最终验收。
