@@ -149,8 +149,25 @@ def resample_and_align(bus_df, branch_df=None, keep_cols=None,
                 f"实际列: {list(branch_df.columns)}. "
                 f"请检查 common.py 中 TARGET_COL 配置或 CSV 列名."
             )
-        br_idx = branch_df.set_index("time")[[TARGET_COL]] \
-                          .rename(columns={TARGET_COL: "y_ac"})
+        _branch_cols = [TARGET_COL]
+        _rename = {TARGET_COL: "y_ac"}
+        # 可选 nuisance 辅助标签仅用于训练另一个总线侧分类器；绝不直接作为
+        # 主模型输入。推理无分路标签时仍由 nuisance_clf 从总线特征预测。
+        if os.environ.get("NILM_ENABLE_NUISANCE_AUX", "").strip() == "1":
+            import re as _re
+            _target_parts = set(str(TARGET_COL).lower().split("+"))
+            _nuisance_cols = [
+                c for c in branch_df.columns
+                if _re.fullmatch(r"p\d+", str(c).lower()) and c not in _target_parts
+            ]
+            if _nuisance_cols:
+                _nuis = branch_df[_nuisance_cols].apply(
+                    pd.to_numeric, errors="coerce").sum(axis=1, skipna=False)
+                branch_df = branch_df.copy()
+                branch_df["__y_nuisance__"] = _nuis
+                _branch_cols.append("__y_nuisance__")
+                _rename["__y_nuisance__"] = "y_nuisance"
+        br_idx = branch_df.set_index("time")[_branch_cols].rename(columns=_rename)
         df = bus_rs.join(br_idx, how="inner").dropna(subset=["y_ac"])
     else:
         df = bus_rs.copy()

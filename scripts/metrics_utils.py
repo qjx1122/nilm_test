@@ -35,13 +35,33 @@ def compute_classification_metrics(y_true, y_pred, p_score=None):
     return out
 
 
-def compute_regression_metrics(y_true, y_pred, sample_period_h=0.25):
+def compute_regression_metrics(y_true, y_pred, sample_period_h=0.25,
+                               on_threshold_W=None):
     """
-    功率回归指标
+    功率回归指标。
+
+    除净 SAE 外，始终分解输出真实 ON 区间的能耗偏差与真实 OFF 区间的
+    预测能耗，避免 ON 低估和 OFF 误报在净能耗中互相抵消。
+
     sample_period_h: 采样周期 (小时), 15min=0.25, 用于能耗换算
+    on_threshold_W: 真实 ON 阈值；None 时动态读取当前用户 common.ON_THR_W
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
+    if on_threshold_W is None:
+        # run_user_pipeline 的用户级阈值通过环境变量注入，各脚本只覆写自身
+        # 模块全局量；因此这里必须优先读环境，不能只读 common.py 默认值。
+        import os
+        _env_on_thr = os.environ.get("NILM_USER_ON_THR_W", "").strip()
+        if _env_on_thr:
+            on_threshold_W = float(_env_on_thr)
+        else:
+            try:
+                from common import ON_THR_W as on_threshold_W
+            except ImportError:
+                on_threshold_W = 10.0
+    on_threshold_W = float(on_threshold_W)
+
     mae  = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     sae  = float(abs(y_pred.sum() - y_true.sum()) / max(y_true.sum(), 1e-6))
@@ -49,10 +69,21 @@ def compute_regression_metrics(y_true, y_pred, sample_period_h=0.25):
                          / max((y_true ** 2).sum(), 1e-6)))
     kwh_true = float(y_true.sum() * sample_period_h / 1000.0)
     kwh_pred = float(y_pred.sum() * sample_period_h / 1000.0)
+
+    true_on = y_true >= on_threshold_W
+    on_kwh_true = float(y_true[true_on].sum() * sample_period_h / 1000.0)
+    on_kwh_pred = float(y_pred[true_on].sum() * sample_period_h / 1000.0)
+    on_kwh_err = float(on_kwh_pred - on_kwh_true)
+    on_energy_bias = float(on_kwh_err / max(on_kwh_true, 1e-6))
+    off_false_kwh = float(y_pred[~true_on].sum() * sample_period_h / 1000.0)
+
     return {
         "MAE_W": mae, "RMSE_W": rmse, "SAE": sae, "NDE": nde,
         "kWh_true": kwh_true, "kWh_pred": kwh_pred,
         "kWh_err": float(kwh_pred - kwh_true),
+        "ON_kWh_true": on_kwh_true, "ON_kWh_pred": on_kwh_pred,
+        "ON_kWh_err": on_kwh_err, "ON_energy_bias": on_energy_bias,
+        "OFF_false_kWh": off_false_kwh,
         "n_samples": int(len(y_true)),
     }
 
@@ -563,6 +594,13 @@ def build_daily_metrics_rows(timestamps, y_true, y_pred, s_true, s_pred,
         kwh_true = float(yt.sum()) * sample_period_h / 1000.0
         kwh_pred = float(yp.sum()) * sample_period_h / 1000.0
         kwh_err = kwh_pred - kwh_true
+        _true_on = st == 1
+        on_kwh_true = float(yt[_true_on].sum()) * sample_period_h / 1000.0
+        on_kwh_pred = float(yp[_true_on].sum()) * sample_period_h / 1000.0
+        on_kwh_err = on_kwh_pred - on_kwh_true
+        on_energy_bias = (on_kwh_err / on_kwh_true
+                          if on_kwh_true >= 1e-6 else None)
+        off_false_kwh = float(yp[~_true_on].sum()) * sample_period_h / 1000.0
         # [v13.14] SAE 边界保护: kwh_true ≈ 0 时 (全 OFF 天), SAE 无意义, 记为 None
         # 传统定义 SAE = |kwh_err| / kwh_true 在 kwh_true=0 时爆炸 (如 8e7),
         # 会污染整体统计. 全 OFF 天用户关心的是 kwh_pred 绝对值 (是否有误报能耗),
@@ -601,6 +639,12 @@ def build_daily_metrics_rows(timestamps, y_true, y_pred, s_true, s_pred,
             "kWh_true": round(kwh_true, 6),
             "kWh_pred": round(kwh_pred, 6),
             "kWh_err": round(kwh_err, 6),
+            "ON_kWh_true": round(on_kwh_true, 6),
+            "ON_kWh_pred": round(on_kwh_pred, 6),
+            "ON_kWh_err": round(on_kwh_err, 6),
+            "ON_energy_bias": (round(on_energy_bias, 6)
+                               if on_energy_bias is not None else ""),
+            "OFF_false_kWh": round(off_false_kwh, 6),
             "TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn),
         }
         if date_labels is not None:

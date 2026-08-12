@@ -32,6 +32,7 @@ from sklearn.ensemble import (GradientBoostingClassifier,
                               GradientBoostingRegressor,
                               RandomForestRegressor)
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
 
 from common import (ARTIFACT_DIR, MODEL_DIR, PRED_DIR, METRIC_DIR,
                     MODEL_PKL, MODEL_V42_PKL,
@@ -114,6 +115,22 @@ USE_RESIDUAL_CALIB = True       # L4: 残差校正层 (在 val 集上学, 推理
 if _os.environ.get("NILM_BASELINE_MODE") == "1":
     USE_DRIFT_FEATURES = False  # 基线模式不带漂移特征
     USE_RESIDUAL_CALIB = False  # 基线模式不带残差校正
+
+
+def parse_json_dates(raw, env_name):
+    """解析 JSON 日期字符串数组，返回 ISO 日期集合。"""
+    if not raw:
+        return set()
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{env_name} 必须为 JSON 日期字符串数组: {exc}") from exc
+    if not isinstance(values, list) or not all(isinstance(v, str) and v.strip() for v in values):
+        raise ValueError(f"{env_name} 必须为 JSON 日期字符串数组")
+    normalized = [pd.Timestamp(v.strip()).strftime("%Y-%m-%d") for v in values]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{env_name} 不允许重复日期")
+    return set(normalized)
 
 
 def parse_fixed_top_cols(raw, available_cols):
@@ -321,66 +338,108 @@ def main():
             json.dumps(skip_info, ensure_ascii=False), encoding="utf-8")
         sys.exit(13)
 
-    # ---------- 2c. 特征工程 (v6: 含漂移感知) ----------
-    with Timer("特征工程 v6 (train相关性+差分+滚动+滞后+时间+温度+漂移)", log):
-        corr = df.iloc[idx_tr][feat_cols_all].corrwith(df.iloc[idx_tr]["y_ac"]).abs() \
-                                           .sort_values(ascending=False)
-        # [v14.1] 可从已审计 manifest 冻结 Top-K 顺序，避免追加 OFF 日使
-        # 第 3/4 名翻转后连带替换大量 Top-3 派生特征；默认仅按 train 选择。
-        _fixed_top_cols_raw = _os.environ.get("NILM_FIXED_TOP_COLS", "").strip()
-        _feature_selection_source = "train_correlation"
-        if _fixed_top_cols_raw:
-            top_cols = parse_fixed_top_cols(_fixed_top_cols_raw, feat_cols_all)
-            _feature_selection_source = "fixed_manifest"
-            log.info(f"  Top-{len(top_cols)} 使用冻结 manifest, 例: {top_cols[:5]} ...")
-        else:
-            top_cols = corr.head(25).index.tolist()
-            log.info(f"  Top-25 仅按 train 相关性选择, 例: {top_cols[:5]} ...")
-
-        _feature_fit_dates = sorted({
-            str(d) for d in pd.to_datetime(df.index[idx_tr]).normalize().date
-        })
-
-        # v6: 构造温度-功率 LUT (仅按 train 拟合，推理阶段复用)
-        # v13.15: 同步导出 temp_power_lut.csv, 便于事后审计与漂移对比
-        temp_power_lut = None
-        temp_power_lut_meta = None
-        if USE_DRIFT_FEATURES and weather_df is not None:
-            temp_power_lut, temp_power_lut_meta = build_temp_power_lut(
-                df.iloc[idx_tr], weather_df, top_cols, return_meta=True)
-            n_bins = len([k for k in temp_power_lut if isinstance(k, tuple)])
-            log.info(f"  [v6] 温度-功率 LUT 构造完成: {n_bins} 个桶, "
-                     f"全局中位={temp_power_lut.get('__global_median__', 0):.1f}")
-            # v13.15: 训练侧 CSV 导出
-            _lut_csv_path = METRIC_DIR / "temp_power_lut.csv"
-            export_temp_power_lut_csv(temp_power_lut, _lut_csv_path,
-                                      meta=temp_power_lut_meta, logger=log)
-        
-        X_df = build_features(df, top_cols, weather_df=weather_df,
-                              temp_power_lut=temp_power_lut)
-        feat_names = X_df.columns.tolist()
-        log.info(f"  最终特征维度: {len(feat_names)}")
-        log.info(f"    - 原始电参量: 25")
-        log.info(f"    - 一阶差分  : 10")
-        log.info(f"    - 滚动统计  : 10 (Top-5 × mean/std, 窗=4)")
-        log.info(f"    - 滞后项    :  6 (Top-3 × lag1/lag2)")
-        log.info(f"    - 时间特征  :  9 (含 sin/cos 周期编码 + 季节)")
-        if USE_WEATHER_FEATURES:
-            log.info(f"    - 温度特征  : 12 (即时+统计+趋势+物理派生, v5)")
-        if USE_DRIFT_FEATURES and temp_power_lut is not None:
-            log.info(f"    - 漂移特征  :  5 (用户行为基线+温度残差, v6)")
-
-    # [v13.7] NaN 硬检测: 训练特征若含 NaN, sklearn 会崩; 尽早暴露避免坏模型入 bundle
-    assert_no_nan_features(X_df, stage_name="train", logger=log,
-                           raise_on_nan=True)
-    X = X_df.values.astype(np.float32)
+    # ---------- 2c. Stage-1 / Stage-2 独立样本与特征视图 ----------
     y = df["y_ac"].values.astype(np.float32)
-    # v6.12.6 单口径: 训练标签用 ON_THR_W=10W (评估同口径)
     state = (y >= ON_THR_W).astype(int)
     on_pct = float(state.mean() * 100)
     log.info(f"  样本 {len(y)} | ON 占比 {on_pct:.2f}% "
              f"(单口径阈值 ON_THR_W={ON_THR_W} W)")
 
+    # stage2-only 日期必须已被上游 include 并锚定到 train。Stage-1 完全看不到
+    # 这些日期；Stage-2 仍只消费其中 ON 样本，实现高功率标签单向注入。
+    _stage2_only_dates = parse_json_dates(
+        _os.environ.get("NILM_STAGE2_ONLY_DATES", "").strip(),
+        "NILM_STAGE2_ONLY_DATES",
+    )
+    _all_dates = pd.DatetimeIndex(df.index).strftime("%Y-%m-%d")
+    _train_dates_set = set(_all_dates[idx_tr])
+    _missing_stage2_dates = sorted(_stage2_only_dates - _train_dates_set)
+    if _missing_stage2_dates:
+        raise ValueError(
+            "NILM_STAGE2_ONLY_DATES 必须全部属于最终 train split，缺失: "
+            f"{_missing_stage2_dates}"
+        )
+    _stage1_keep = ~np.isin(_all_dates[idx_tr], sorted(_stage2_only_dates))
+    idx_stage1_tr = idx_tr[_stage1_keep]
+    idx_stage2_tr = idx_tr.copy()
+    idx_stage2_on = idx_stage2_tr[state[idx_stage2_tr] == 1]
+    if len(idx_stage1_tr) == 0 or len(np.unique(state[idx_stage1_tr])) < 2:
+        raise ValueError("Stage-1 独立训练视图为空或仅含单类")
+    if len(idx_stage2_on) < 30:
+        raise ValueError(f"Stage-2 train-ON 样本不足: {len(idx_stage2_on)} < 30")
+
+    with Timer("Stage-1/Stage-2 独立特征工程", log):
+        # Stage-1 用完整 train（含 hard negatives）按目标功率选择；Stage-2
+        # 只在 train-ON 内按功率选择。两者样本和 manifest 完全独立。
+        _s1_df = df.iloc[idx_stage1_tr]
+        corr_stage1 = _s1_df[feat_cols_all].corrwith(_s1_df["y_ac"]).abs() \
+                                              .sort_values(ascending=False)
+        _s2_df = df.iloc[idx_stage2_on]
+        corr_stage2 = _s2_df[feat_cols_all].corrwith(_s2_df["y_ac"]).abs() \
+                                             .sort_values(ascending=False)
+
+        _legacy_fixed = _os.environ.get("NILM_FIXED_TOP_COLS", "").strip()
+        _fixed_stage1 = _os.environ.get("NILM_FIXED_STAGE1_TOP_COLS", "").strip() or _legacy_fixed
+        _fixed_stage2 = _os.environ.get("NILM_FIXED_STAGE2_TOP_COLS", "").strip() or _legacy_fixed
+        if _fixed_stage1:
+            stage1_top_cols = parse_fixed_top_cols(_fixed_stage1, feat_cols_all)
+            _stage1_feature_source = "fixed_manifest"
+        else:
+            stage1_top_cols = corr_stage1.head(25).index.tolist()
+            _stage1_feature_source = "train_target_power_correlation"
+        if _fixed_stage2:
+            stage2_top_cols = parse_fixed_top_cols(_fixed_stage2, feat_cols_all)
+            _stage2_feature_source = "fixed_manifest"
+        else:
+            stage2_top_cols = corr_stage2.head(25).index.tolist()
+            _stage2_feature_source = "train_on_power_correlation"
+        log.info(f"  Stage-1 Top-{len(stage1_top_cols)} ({_stage1_feature_source}): "
+                 f"{stage1_top_cols[:5]} ...")
+        log.info(f"  Stage-2 Top-{len(stage2_top_cols)} ({_stage2_feature_source}): "
+                 f"{stage2_top_cols[:5]} ...")
+
+        stage1_temp_power_lut = stage2_temp_power_lut = None
+        stage1_lut_meta = stage2_lut_meta = None
+        if USE_DRIFT_FEATURES and weather_df is not None:
+            stage1_temp_power_lut, stage1_lut_meta = build_temp_power_lut(
+                df.iloc[idx_stage1_tr], weather_df, stage1_top_cols, return_meta=True)
+            stage2_temp_power_lut, stage2_lut_meta = build_temp_power_lut(
+                df.iloc[idx_stage2_on], weather_df, stage2_top_cols, return_meta=True)
+            export_temp_power_lut_csv(
+                stage1_temp_power_lut, METRIC_DIR / "temp_power_lut_stage1.csv",
+                meta=stage1_lut_meta, logger=log)
+            export_temp_power_lut_csv(
+                stage2_temp_power_lut, METRIC_DIR / "temp_power_lut_stage2.csv",
+                meta=stage2_lut_meta, logger=log)
+            # 保留旧文件名，兼容既有审计工具；其语义为 Stage-1 LUT。
+            export_temp_power_lut_csv(
+                stage1_temp_power_lut, METRIC_DIR / "temp_power_lut.csv",
+                meta=stage1_lut_meta, logger=log)
+
+        X_stage1_df = build_features(
+            df, stage1_top_cols, weather_df=weather_df,
+            temp_power_lut=stage1_temp_power_lut)
+        X_stage2_df = build_features(
+            df, stage2_top_cols, weather_df=weather_df,
+            temp_power_lut=stage2_temp_power_lut)
+        stage1_feat_names = X_stage1_df.columns.tolist()
+        stage2_feat_names = X_stage2_df.columns.tolist()
+        log.info(f"  独立特征维度: Stage-1={len(stage1_feat_names)}, "
+                 f"Stage-2={len(stage2_feat_names)}")
+
+    assert_no_nan_features(X_stage1_df, stage_name="train/stage1", logger=log,
+                           raise_on_nan=True)
+    assert_no_nan_features(X_stage2_df, stage_name="train/stage2", logger=log,
+                           raise_on_nan=True)
+    X_stage1 = X_stage1_df.values.astype(np.float32)
+    X_stage2 = X_stage2_df.values.astype(np.float32)
+
+    # 旧字段别名只用于兼容 d87/审计代码；主模型训练不再共享该视图。
+    top_cols = stage1_top_cols
+    feat_names = stage1_feat_names
+    temp_power_lut = stage1_temp_power_lut
+    _feature_selection_source = _stage1_feature_source
+    _feature_fit_dates = sorted(set(_all_dates[idx_stage1_tr]))
     # ---------- [v6.12.6+v6.15.0-graceful-v5] 数据质量门 2: 单类标签 ----------
     # 触发条件: ON 占比 = 0% (全 OFF) 或 100% (全 ON), GradientBoostingClassifier 拒绝单类
     # 退出码 12 -> 软跳过
@@ -465,18 +524,54 @@ def main():
         log.info(f"        月份分布: " +
                  ", ".join([f"{str(k)}={v}" for k, v in mc.items()]))
 
-    X_tr, X_va = X[idx_tr], X[idx_va]
+    X1_tr, X1_va = X_stage1[idx_tr], X_stage1[idx_va]
+    X2_tr, X2_va = X_stage2[idx_tr], X_stage2[idx_va]
     y_tr, y_va = y[idx_tr], y[idx_va]
     s_tr, s_va = state[idx_tr], state[idx_va]
     t_tr, t_va = df.index[idx_tr], df.index[idx_va]
-    # 季节标签 (v5 温度驱动 / v4.2 月份)
     sea_tr, sea_va = season_labels_all[idx_tr], season_labels_all[idx_va]
 
-    # ---------- 4. 标准化 ----------
-    with Timer("StandardScaler 拟合 (仅 train)", log):
-        scaler = StandardScaler().fit(X_tr)
-        X_tr_s = scaler.transform(X_tr)
-        X_va_s = scaler.transform(X_va)
+    # ---------- 4. 独立标准化 ----------
+    with Timer("Stage-1/Stage-2 StandardScaler 独立拟合", log):
+        stage1_scaler = StandardScaler().fit(X_stage1[idx_stage1_tr])
+        # 回归器只消费 ON，因此 scaler 也仅按 Stage-2 train-ON 拟合。
+        stage2_scaler = StandardScaler().fit(X_stage2[idx_stage2_on])
+        X1_tr_s = stage1_scaler.transform(X1_tr)
+        X1_va_s = stage1_scaler.transform(X1_va)
+        X2_tr_s = stage2_scaler.transform(X2_tr)
+        X2_va_s = stage2_scaler.transform(X2_va)
+        X1_fit_s = stage1_scaler.transform(X_stage1[idx_stage1_tr])
+
+    # 旧 bundle 的 scaler 别名保持 Stage-1 语义，老推理仍可加载。
+    scaler = stage1_scaler
+
+    # ---------- 4b. 可选 p3/p4 nuisance 辅助模型 ----------
+    # 主分类器保持原 Stage-1 输入不变；辅助模型只在独立 validation 上选择
+    # 抑制强度 alpha，score = p_ac * (1 - alpha * p_nuisance)。这样不会把
+    # p3/p4 分路真值作为推理输入，也不会用 test/inference 拟合或选参。
+    nuisance_clf = None
+    nuisance_alpha = 0.0
+    _nuis_tr = np.zeros(len(X1_tr_s), dtype=float)
+    _nuis_va = np.zeros(len(X1_va_s), dtype=float)
+    nuisance_aux_enabled = (
+        _os.environ.get("NILM_ENABLE_NUISANCE_AUX", "").strip() == "1" and
+        "y_nuisance" in df.columns
+    )
+    if nuisance_aux_enabled:
+        _nuisance_state = (df["y_nuisance"].values.astype(float) >= ON_THR_W).astype(int)
+        _nuis_fit = _nuisance_state[idx_stage1_tr]
+        if len(np.unique(_nuis_fit)) >= 2:
+            nuisance_clf = LogisticRegression(
+                C=1.0, max_iter=1000, class_weight="balanced",
+                random_state=RANDOM_SEED,
+            ).fit(X1_fit_s, _nuis_fit)
+            _nuis_tr = nuisance_clf.predict_proba(X1_tr_s)[:, 1]
+            _nuis_va = nuisance_clf.predict_proba(X1_va_s)[:, 1]
+            log.info(f"  [Nuisance] p3/p4 总线侧辅助分类器启用: "
+                     f"train ON={int(_nuis_fit.sum())}/{len(_nuis_fit)}")
+        else:
+            nuisance_aux_enabled = False
+            log.warning("  [Nuisance] train nuisance 标签单类，自动禁用")
 
     # ---------- 5. Stage-1 分类器 ----------
     log.info("-" * 70)
@@ -487,18 +582,33 @@ def main():
         subsample=0.8, random_state=RANDOM_SEED,
     )
     with Timer("Stage-1 训练", log):
-        clf.fit(X_tr_s, s_tr)
+        clf.fit(X1_fit_s, state[idx_stage1_tr])
+    log.info(f"  Stage-1 训练视图: {len(idx_stage1_tr)} 点 / "
+             f"{len(set(_all_dates[idx_stage1_tr]))} 日；"
+             f"排除 Stage2-only={sorted(_stage2_only_dates)}")
 
-    # ---------- 5.1 [B] 阈值优化 (F_beta + 后处理) ----------
+    # ---------- 5.1 [B] 阈值 + nuisance 抑制强度优化 ----------
     with Timer(f"[B] Stage-1 阈值搜索 (F{FBETA} + 后处理 min_on={POST_MIN_ON})", log):
-        p_va = clf.predict_proba(X_va_s)[:, 1]
-        result = search_best_threshold(
-            p_va, s_va, beta=FBETA,
-            min_on=POST_MIN_ON,
-            fill_short_off=POST_FILL_SHORT_OFF,
-        )
+        _p_va_base = clf.predict_proba(X1_va_s)[:, 1]
+        _alpha_candidates = ([0.0, 0.25, 0.50, 0.75, 1.0]
+                             if nuisance_clf is not None else [0.0])
+        result = None
+        p_va = None
+        for _alpha in _alpha_candidates:
+            _p_candidate = _p_va_base * (1.0 - _alpha * _nuis_va)
+            _result_candidate = search_best_threshold(
+                _p_candidate, s_va, beta=FBETA,
+                min_on=POST_MIN_ON,
+                fill_short_off=POST_FILL_SHORT_OFF,
+            )
+            if (result is None or
+                    _result_candidate["best_fbeta"] > result["best_fbeta"] + 1e-12):
+                result = _result_candidate
+                p_va = _p_candidate
+                nuisance_alpha = float(_alpha)
         best_thr = result["best_thr"]
         log.info(f"  最佳阈值 = {best_thr:.3f}   "
+                 f"nuisance_alpha={nuisance_alpha:.2f}   "
                  f"Val F{FBETA} = {result['best_fbeta']:.4f}")
 
     # 保存阈值-指标曲线
@@ -508,7 +618,9 @@ def main():
     log.info(f"  阈值曲线 -> {curve_path}  ({len(curve_df)} 行)")
 
     # Train / Val 预测 (含后处理)
-    p_tr = clf.predict_proba(X_tr_s)[:, 1]
+    p_tr = clf.predict_proba(X1_tr_s)[:, 1]
+    if nuisance_clf is not None:
+        p_tr = p_tr * (1.0 - nuisance_alpha * _nuis_tr)
     pred_state_raw_tr = (p_tr >= best_thr).astype(int)
     pred_state_raw_va = (p_va >= best_thr).astype(int)
     # 后处理
@@ -574,7 +686,7 @@ def main():
     )
     with Timer("[A] 季节分层 MoE 训练 (3 expert × 3 quantile + 3 fallback)", log):
         # v5: 用 sea_tr (温度路由) 取代原来的 t_tr (月份路由)
-        moe.fit(X_tr_s, y_tr, s_tr, sea_tr, sample_weight=sw_full)
+        moe.fit(X2_tr_s, y_tr, s_tr, sea_tr, sample_weight=sw_full)
 
     # 兼容旧 bundle 的别名 (供下游脚本无缝读取)
     reg      = moe   # 注意: 这里 reg 已是 MoE 对象, 推理时需传 timestamps
@@ -594,9 +706,9 @@ def main():
         return y_pred_filt, state_filt, p_med, p_low, p_high
 
     y_pred_tr, _, p_med_tr, p_low_tr, p_high_tr = \
-        predict_combined_moe(X_tr_s, p_tr, sea_tr)
+        predict_combined_moe(X2_tr_s, p_tr, sea_tr)
     y_pred_va, _, p_med_va, p_low_va, p_high_va = \
-        predict_combined_moe(X_va_s, p_va, sea_va)
+        predict_combined_moe(X2_va_s, p_va, sea_va)
 
     reg_tr = compute_regression_metrics(y_tr, y_pred_tr)
     reg_va = compute_regression_metrics(y_va, y_pred_va)
@@ -624,67 +736,193 @@ def main():
     log_residual_bias_by_season(y_tr, y_pred_tr, s_tr, sea_tr, "Train")
     log_residual_bias_by_season(y_va, y_pred_va, s_va, sea_va, "Val  ")
 
-    # ---------- 7. [L4] 训练残差校正层 (在 val 集上学) ----------
+    # ---------- 7. validation 按日期留一交叉校正/选层 ----------
     residual_calib = None
-    if USE_RESIDUAL_CALIB:
+    y_tr_calib = y_pred_tr.copy()
+    y_va_calib = y_pred_va.copy()
+    y_va_scale = y_pred_va.copy()
+    selected_stage2_layer = "raw"
+    stage2_scale = 1.0
+    stage2_scale_bounds = (0.85, 1.15)
+    _val_dates = sorted(set(pd.DatetimeIndex(t_va).strftime("%Y-%m-%d")))
+    _va_date_arr = pd.DatetimeIndex(t_va).strftime("%Y-%m-%d")
+
+    if stage2_top_cols and stage2_top_cols[0] in df.columns:
+        top1 = df[stage2_top_cols[0]].astype(float)
+        recent_24h = top1.rolling(window=96, min_periods=4,
+                                  closed="left").mean().bfill().values
+    else:
+        recent_24h = np.zeros(len(df))
+    recent_va = recent_24h[idx_va]
+    state_pred_va, _ = apply_postprocess(
+        pred_state_raw_va, np.zeros_like(pred_state_raw_va),
+        POST_MIN_ON, POST_FILL_SHORT_OFF,
+    )
+
+    _oof_l4 = y_pred_va.copy()
+    _oof_scale = y_pred_va.copy()
+    _fold_scales = {}
+    _l4_oof_available = False
+    if USE_RESIDUAL_CALIB and len(_val_dates) >= 2:
         log.info("-" * 70)
-        log.info("[L4] 残差校正层训练 (在 val 集上学习, 不污染主模型)")
+        log.info(f"[Calibration] validation 按日期留一交叉拟合/选层: {_val_dates}")
+        for _holdout_date in _val_dates:
+            _fit_mask = _va_date_arr != _holdout_date
+            _hold_mask = _va_date_arr == _holdout_date
+            _fold_calib = ResidualCalibrator(n_estimators=50, max_depth=3,
+                                             learning_rate=0.05)
+            _fold_calib.fit(
+                y_pred_raw=y_pred_va[_fit_mask], y_true=y_va[_fit_mask],
+                state_pred=state_pred_va[_fit_mask],
+                timestamps=t_va[_fit_mask], weather_df=weather_df,
+                recent_signal=recent_va[_fit_mask],
+                season_labels=sea_va[_fit_mask], logger=None,
+            )
+            if _fold_calib._trained:
+                _oof_l4[_hold_mask] = _fold_calib.apply(
+                    y_pred_va[_hold_mask], t_va[_hold_mask], weather_df,
+                    recent_va[_hold_mask], sea_va[_hold_mask],
+                    state_pred=state_pred_va[_hold_mask],
+                )
+                _l4_oof_available = True
+            _p_fit = y_pred_va[_fit_mask].astype(float)
+            _y_fit = y_va[_fit_mask].astype(float)
+            _den_fold = float(np.dot(_p_fit, _p_fit))
+            _scale_fold = 1.0 if _den_fold <= 0 else float(np.clip(
+                np.dot(_p_fit, _y_fit) / _den_fold,
+                stage2_scale_bounds[0], stage2_scale_bounds[1],
+            ))
+            _fold_scales[_holdout_date] = _scale_fold
+            _oof_scale[_hold_mask] = y_pred_va[_hold_mask] * _scale_fold
 
-        # 计算 val 集的 recent_signal (Top-1 列近 24h 滚动均值)
-        if top_cols and top_cols[0] in df.columns:
-            top1 = df[top_cols[0]].astype(float)
-            recent_24h = top1.rolling(window=96, min_periods=4,
-                                      closed="left").mean().bfill().values
-        else:
-            recent_24h = np.zeros(len(df))
-
-        recent_va = recent_24h[idx_va]
-        # val 的 state_pred (用主模型推理结果)
-        state_pred_va, _ = apply_postprocess(
-            pred_state_raw_va, np.zeros_like(pred_state_raw_va),
-            POST_MIN_ON, POST_FILL_SHORT_OFF,
+        # 生产参数在选层结束后用全部 validation 重拟合；test/inference 从未参与。
+        residual_calib = ResidualCalibrator(n_estimators=50, max_depth=3,
+                                            learning_rate=0.05)
+        residual_calib.fit(
+            y_pred_raw=y_pred_va, y_true=y_va, state_pred=state_pred_va,
+            timestamps=t_va, weather_df=weather_df,
+            recent_signal=recent_va, season_labels=sea_va, logger=log,
         )
-
-        with Timer("[L4] 训练 ResidualCalibrator (50 trees, depth=3)", log):
-            residual_calib = ResidualCalibrator(n_estimators=50, max_depth=3,
-                                                learning_rate=0.05)
-            residual_calib.fit(
-                y_pred_raw=y_pred_va, y_true=y_va,
-                state_pred=state_pred_va,
-                timestamps=t_va, weather_df=weather_df,
-                recent_signal=recent_va, season_labels=sea_va,
-                logger=log,
-            )
-
-        # 验证: val 集校正前后 MAE 对比
-        y_tr_calib = y_pred_tr.copy()   # 默认无变化
-        y_va_calib = y_pred_va.copy()
         if residual_calib._trained:
-            # train 也需要近期信号 (与 val 同口径)
             recent_tr = recent_24h[idx_tr]
-            state_pred_tr_filt, _ = apply_postprocess(
-                pred_state_raw_tr, np.zeros_like(pred_state_raw_tr),
-                POST_MIN_ON, POST_FILL_SHORT_OFF,
-            )
             y_tr_calib = residual_calib.apply(
                 y_pred_tr, t_tr, weather_df, recent_tr, sea_tr,
-                state_pred=state_pred_tr_filt,
+                state_pred=pred_state_tr,
             )
             y_va_calib = residual_calib.apply(
                 y_pred_va, t_va, weather_df, recent_va, sea_va,
                 state_pred=state_pred_va,
             )
-            mae_before = np.abs(y_pred_va - y_va).mean()
-            mae_after  = np.abs(y_va_calib - y_va).mean()
-            log.info(f"  [L4] Val MAE: 校正前 {mae_before:.2f}W -> "
-                     f"校正后 {mae_after:.2f}W  (变化 {mae_after-mae_before:+.2f}W)")
+
+        _p_all = y_pred_va.astype(float)
+        _y_all = y_va.astype(float)
+        _den_all = float(np.dot(_p_all, _p_all))
+        if _den_all > 0:
+            stage2_scale = float(np.clip(
+                np.dot(_p_all, _y_all) / _den_all,
+                stage2_scale_bounds[0], stage2_scale_bounds[1],
+            ))
+        y_va_scale = y_pred_va * stage2_scale
+
+        _candidate_oof = {"raw": y_pred_va, "scale": _oof_scale}
+        if _l4_oof_available:
+            _candidate_oof["l4"] = _oof_l4
+    else:
+        _candidate_oof = {"raw": y_pred_va}
+
+    _selection_metrics = {}
+    _fold_selection_metrics = {}
+    for _name, _pred in _candidate_oof.items():
+        _m = compute_regression_metrics(y_va, _pred)
+        _mean_bias_w = float(abs(np.mean(_pred) - np.mean(y_va)))
+        _selection_metrics[_name] = {
+            "MAE_W": float(_m["MAE_W"]), "SAE": float(_m["SAE"]),
+            "mean_bias_W": _mean_bias_w,
+            "ON_energy_bias": float(_m["ON_energy_bias"]),
+            "OFF_false_kWh": float(_m["OFF_false_kWh"]),
+            # 不以净 SAE 单独选层；MAE 与净平均偏差等权，另由下方
+            # ON/OFF 分解门阻止以 OFF 虚假能耗抵消 ON 低估。
+            "selection_score": float(_m["MAE_W"] + _mean_bias_w),
+            "kWh_true": float(_m["kWh_true"]),
+            "kWh_pred": float(_m["kWh_pred"]),
+        }
+        _fold_selection_metrics[_name] = {}
+        for _date in _val_dates:
+            _dm = _va_date_arr == _date
+            _dm_metrics = compute_regression_metrics(y_va[_dm], _pred[_dm])
+            _fold_selection_metrics[_name][_date] = {
+                "MAE_W": float(_dm_metrics["MAE_W"]),
+                "mean_bias_W": float(abs(np.mean(_pred[_dm]) - np.mean(y_va[_dm]))),
+                "ON_energy_bias_abs": float(abs(_dm_metrics["ON_energy_bias"])),
+                "OFF_false_kWh": float(_dm_metrics["OFF_false_kWh"]),
+            }
+
+    # 校正层必须跨日期稳定：严格多数 holdout 日期的 MAE 有 >=1% 实质改善，
+    # 且严格多数日期的 ON 能耗偏差也改善。聚合层还必须满足 SAE/ON 偏差门，
+    # 并且 OFF 虚假能耗不得比 raw 增加超过 5% + 0.05kWh。否则退回 raw。
+    _stable = ["raw"]
+    _n_required = max(1, len(_val_dates) // 2 + 1)
+    _raw_off_false_kwh = _selection_metrics["raw"]["OFF_false_kWh"]
+    for _name in _selection_metrics:
+        if _name == "raw":
+            continue
+        _aggregate_energy_gate = (
+            _selection_metrics[_name]["SAE"] <= 0.20 and
+            abs(_selection_metrics[_name]["ON_energy_bias"]) <= 0.20 and
+            _selection_metrics[_name]["OFF_false_kWh"] <=
+            1.05 * _raw_off_false_kwh + 0.05
+        )
+        _mae_wins = sum(
+            _fold_selection_metrics[_name][d]["MAE_W"] <=
+            0.99 * _fold_selection_metrics["raw"][d]["MAE_W"]
+            for d in _val_dates
+        )
+        _bias_wins = sum(
+            _fold_selection_metrics[_name][d]["ON_energy_bias_abs"] <=
+            _fold_selection_metrics["raw"][d]["ON_energy_bias_abs"]
+            for d in _val_dates
+        )
+        _selection_metrics[_name]["mae_win_dates"] = int(_mae_wins)
+        _selection_metrics[_name]["on_bias_win_dates"] = int(_bias_wins)
+        _selection_metrics[_name]["aggregate_energy_gate"] = bool(
+            _aggregate_energy_gate)
+        if (_aggregate_energy_gate and _mae_wins >= _n_required and
+                _bias_wins >= _n_required):
+            _stable.append(_name)
+    selected_stage2_layer = min(
+        _stable, key=lambda k: (_selection_metrics[k]["selection_score"],
+                                _selection_metrics[k]["MAE_W"], k)
+    )
+    log.info(f"  OOF 指标={_selection_metrics}")
+    log.info(f"  全 val 重拟合 scale={stage2_scale:.6f} bounds={stage2_scale_bounds}")
+    log.info(f"  ✓ validation 日期留一 OOF 选择 Stage-2 层: {selected_stage2_layer}")
+    stage2_calibration_meta = {
+        "protocol": "leave_one_validation_date_out",
+        "validation_dates": _val_dates,
+        "fold_scales": _fold_scales,
+        "scale": stage2_scale,
+        "scale_bounds": list(stage2_scale_bounds),
+        "oof_selection_metrics": _selection_metrics,
+        "fold_selection_metrics": _fold_selection_metrics,
+        "stability_required_dates": int(_n_required),
+        "acceptance_gates": {
+            "SAE_max": 0.20,
+            "ON_energy_bias_abs_max": 0.20,
+            "OFF_false_kWh_vs_raw_max_ratio": 1.05,
+            "OFF_false_kWh_absolute_slack": 0.05,
+            "daily_MAE_improvement_min": 0.01,
+            "daily_win_rule": "strict_majority",
+        },
+        "stable_candidates": _stable,
+        "selected_layer": selected_stage2_layer,
+    }
 
     # ---------- 6c. [新增] Fallback 全局回归器指标计算 ----------
     # MoE 内的 fallback 是无季节路由的全局 GBR, 作为对照基线
     log.info("-" * 70)
     log.info("[Fallback 全局回归器] 计算指标 (无季节路由对照)")
-    p_fb_tr = np.clip(reg_global_p50.predict(X_tr_s), 0, None)
-    p_fb_va = np.clip(reg_global_p50.predict(X_va_s), 0, None)
+    p_fb_tr = np.clip(reg_global_p50.predict(X2_tr_s), 0, None)
+    p_fb_va = np.clip(reg_global_p50.predict(X2_va_s), 0, None)
     state_pred_tr_filt_fb, y_pred_fb_tr = apply_postprocess(
         pred_state_raw_tr, p_fb_tr, POST_MIN_ON, POST_FILL_SHORT_OFF,
     )
@@ -728,9 +966,9 @@ def main():
     rf = RandomForestRegressor(n_estimators=300, max_depth=8,
                                random_state=RANDOM_SEED, n_jobs=-1)
     with Timer("RF 训练", log):
-        rf.fit(X_tr_s, y_tr)
-    y_rf_tr = np.clip(rf.predict(X_tr_s), 0, None)
-    y_rf_va = np.clip(rf.predict(X_va_s), 0, None)
+        rf.fit(X1_fit_s, y[idx_stage1_tr])
+    y_rf_tr = np.clip(rf.predict(X1_tr_s), 0, None)
+    y_rf_va = np.clip(rf.predict(X1_va_s), 0, None)
     # v6.12.6 RF baseline 用统一 ON_THR_W=10W (与训练标签同口径)
     s_rf_tr = (y_rf_tr >= ON_THR_W).astype(int)
     s_rf_va = (y_rf_va >= ON_THR_W).astype(int)
@@ -1052,23 +1290,44 @@ def main():
 
     # 清除 MoE 中不可 pickle 的闭包函数 (gbr_factory) 和 logger
     moe.strip_for_save()
+    _stage1_train_dates = sorted(set(_all_dates[idx_stage1_tr]))
+    _stage2_train_dates = sorted(set(_all_dates[idx_stage2_tr]))
+    _active_stage2_seasons = sorted(set(season_labels_all[idx_stage2_on]))
     bundle = {
-        "scaler": scaler, "clf": clf, "rf": rf,
+        # 旧字段保留 Stage-1 语义；新代码必须读取独立视图字段。
+        "scaler": stage1_scaler, "clf": clf, "rf": rf,
+        "stage1_scaler": stage1_scaler,
+        "stage2_scaler": stage2_scaler,
+        "nuisance_clf": nuisance_clf,
+        "nuisance_aux_enabled": bool(nuisance_clf is not None),
+        "nuisance_alpha": float(nuisance_alpha),
+        "nuisance_label_threshold_W": float(ON_THR_W),
         "moe": moe,
         "reg":      reg_global_p50,
         "reg_low":  reg_global_low,
         "reg_high": reg_global_high,
-        "feat_cols": top_cols,
-        "feat_names": feat_names,
-        "feature_selection_source": _feature_selection_source,
-        "feature_fit_dates": _feature_fit_dates,
-        "temp_power_lut_fit_source": "train",
+        "feat_cols": stage1_top_cols,
+        "feat_names": stage1_feat_names,
+        "stage1_feat_cols": stage1_top_cols,
+        "stage1_feat_names": stage1_feat_names,
+        "stage2_feat_cols": stage2_top_cols,
+        "stage2_feat_names": stage2_feat_names,
+        "feature_selection_source": "dual_stage_views",
+        "stage1_feature_selection_source": _stage1_feature_source,
+        "stage2_feature_selection_source": _stage2_feature_source,
+        "feature_fit_dates": _stage1_train_dates,
+        "stage1_train_dates": _stage1_train_dates,
+        "stage2_train_dates": _stage2_train_dates,
+        "stage2_only_dates": sorted(_stage2_only_dates),
+        "temp_power_lut_fit_source": "independent_stage_train_views",
         "best_thr": best_thr,
         "ON_THR": ON_THR_W,                       # 兼容旧推理代码 (= ON_THR_TRAIN_W)
         "ON_THR_TRAIN": ON_THR_TRAIN_W,           # v6.13: 训练标签阈值
         "ON_THR_BUSINESS": ON_THR_BUSINESS_W,     # v6.13: 业务评估阈值
         "trained_at": ts_tag,
         "n_train": int(len(y_tr)), "n_val": int(len(y_va)),
+        "n_train_stage1": int(len(idx_stage1_tr)),
+        "n_train_stage2_on": int(len(idx_stage2_on)),
         # 版本与超参 (v6.10: version 字段从 common.PROJECT_VERSION 统一读取)
         "version": (f"v42_baseline_{PROJECT_VERSION}"
                     if _os.environ.get("NILM_BASELINE_MODE") == "1"
@@ -1095,15 +1354,22 @@ def main():
         # v5 新增
         "use_weather_features":  USE_WEATHER_FEATURES,
         "use_drift_features":    USE_DRIFT_FEATURES,
-        "temp_power_lut":        temp_power_lut,   # v6 L1: 用于推理重建漂移特征
-        "use_residual_calib":    USE_RESIDUAL_CALIB,
-        "residual_calib":        residual_calib,   # v6 L4: 残差校正器
+        "temp_power_lut":        stage1_temp_power_lut,
+        "stage1_temp_power_lut": stage1_temp_power_lut,
+        "stage2_temp_power_lut": stage2_temp_power_lut,
+        "use_residual_calib":    bool(USE_RESIDUAL_CALIB),
+        "residual_calib":        residual_calib,
+        "stage2_calibration":    stage2_calibration_meta,
+        "selected_stage2_layer": selected_stage2_layer,
+        "fallback_same_as_active_expert": len(_active_stage2_seasons) == 1,
         "use_temp_based_season": USE_TEMP_BASED_SEASON,
         "weather_latitude":      WEATHER_LATITUDE,
         "weather_longitude":     WEATHER_LONGITUDE,
         "summer_temp_threshold": SUMMER_TEMP_THRESHOLD,
         "winter_temp_threshold": WINTER_TEMP_THRESHOLD,
-        "n_features":            int(X.shape[1]),
+        "n_features":            int(X_stage1.shape[1]),
+        "n_features_stage1":     int(X_stage1.shape[1]),
+        "n_features_stage2":     int(X_stage2.shape[1]),
         # v6.12.1: d87 守卫自适应阈值元数据
         "d87_guard_meta":        d87_guard_meta,
     }
@@ -1135,25 +1401,31 @@ def main():
     # 仅在主模型训练时拆分组件 + 写 meta JSON
     # (NILM_BASELINE_MODE=1 时 03b 调用此脚本, 仅出主 .pkl, 不污染主模型的组件文件)
     if _os.environ.get("NILM_BASELINE_MODE") != "1":
-        joblib.dump(scaler,   MODEL_DIR / "scaler.pkl")
+        joblib.dump(stage1_scaler, MODEL_DIR / "scaler.pkl")
+        joblib.dump(stage1_scaler, MODEL_DIR / "stage1_scaler.pkl")
+        joblib.dump(stage2_scaler, MODEL_DIR / "stage2_scaler.pkl")
         joblib.dump(clf,      MODEL_DIR / "stage1_classifier.pkl")
+        if nuisance_clf is not None:
+            joblib.dump(nuisance_clf, MODEL_DIR / "nuisance_classifier.pkl")
         joblib.dump(moe,      MODEL_DIR / "stage2_moe_bundle.pkl")
         joblib.dump(reg_global_p50,  MODEL_DIR / "stage2_regressor.pkl")        # 全局 fallback
         joblib.dump(reg_global_low,  MODEL_DIR / "stage2_regressor_p10.pkl")
         joblib.dump(reg_global_high, MODEL_DIR / "stage2_regressor_p90.pkl")
         joblib.dump(rf,       MODEL_DIR / "baseline_rf.pkl")
         meta = {k: v for k, v in bundle.items()
-                if k not in ("scaler", "clf", "rf",
-                             "reg", "reg_low", "reg_high", "moe",
-                             "residual_calib")}
-        # v6: temp_power_lut 含 tuple 键, JSON 不支持, 单独序列化为字符串键再写
-        if "temp_power_lut" in meta and meta["temp_power_lut"] is not None:
-            lut_orig = meta["temp_power_lut"]
-            meta["temp_power_lut"] = {
-                (f"{k[0]:.2f}_{k[1]:.2f}" if isinstance(k, tuple) else str(k)): v
-                for k, v in lut_orig.items()
-            }
-            meta["temp_power_lut_note"] = "tuple keys (lo, hi) 已序列化为 'lo_hi' 字符串"
+                if k not in ("scaler", "stage1_scaler", "stage2_scaler",
+                             "clf", "rf", "reg", "reg_low", "reg_high", "moe",
+                             "nuisance_clf", "residual_calib")}
+        # LUT 含 tuple 键，逐个转为 JSON 可审计形式。
+        for _lut_key in ("temp_power_lut", "stage1_temp_power_lut",
+                         "stage2_temp_power_lut"):
+            if meta.get(_lut_key) is not None:
+                lut_orig = meta[_lut_key]
+                meta[_lut_key] = {
+                    (f"{k[0]:.2f}_{k[1]:.2f}" if isinstance(k, tuple) else str(k)): v
+                    for k, v in lut_orig.items()
+                }
+        meta["temp_power_lut_note"] = "tuple keys (lo, hi) 已序列化为 'lo_hi' 字符串"
         # residual_calib 是对象, JSON 不可表达, 仅记录是否存在
         meta["residual_calib_present"] = bool(bundle.get("residual_calib"))
         with open(MODEL_DIR / "model_meta.json", "w", encoding="utf-8") as f:
@@ -1168,17 +1440,37 @@ def main():
     # 而不是主模型 v6.x 的结果, 造成 FN 数等指标与训练日志报告不一致。
     log.info("-" * 70)
     log.info("保存预测明细")
+    y_tr_scale = y_pred_tr * stage2_scale
+    if selected_stage2_layer == "l4":
+        y_tr_selected, y_va_selected = y_tr_calib, y_va_calib
+    elif selected_stage2_layer == "scale":
+        y_tr_selected, y_va_selected = y_tr_scale, y_va_scale
+    else:
+        y_tr_selected, y_va_selected = y_pred_tr, y_pred_va
+    reg_selected_tr = compute_regression_metrics(y_tr, y_tr_selected)
+    reg_selected_va = compute_regression_metrics(y_va, y_va_selected)
+
     if _os.environ.get("NILM_BASELINE_MODE") != "1":
-        save_predictions_csv(t_tr, y_tr, y_pred_tr, s_tr, pred_state_tr, p_tr,
+        save_predictions_csv(t_tr, y_tr, y_tr_selected, s_tr, pred_state_tr, p_tr,
                              y_pred_low=p_low_tr * pred_state_tr,
                              y_pred_high=p_high_tr * pred_state_tr,
                              out_path=PRED_DIR / "train_pred.csv")
         log.info(f"  ✓ {PRED_DIR / 'train_pred.csv'}")
-        save_predictions_csv(t_va, y_va, y_pred_va, s_va, pred_state_va, p_va,
+        save_predictions_csv(t_va, y_va, y_va_selected, s_va, pred_state_va, p_va,
                              y_pred_low=p_low_va * pred_state_va,
                              y_pred_high=p_high_va * pred_state_va,
                              out_path=PRED_DIR / "val_pred.csv")
         log.info(f"  ✓ {PRED_DIR / 'val_pred.csv'}")
+        for _path, _raw, _l4, _scale in [
+            (PRED_DIR / "train_pred.csv", y_pred_tr, y_tr_calib, y_tr_scale),
+            (PRED_DIR / "val_pred.csv", y_pred_va, y_va_calib, y_va_scale),
+        ]:
+            _detail = pd.read_csv(_path, encoding="utf-8-sig")
+            _detail["y_pred_main_raw_W"] = np.round(_raw, 3)
+            _detail["y_pred_main_L4_calib_W"] = np.round(_l4, 3)
+            _detail["y_pred_main_scale_W"] = np.round(_scale, 3)
+            _detail["selected_stage2_layer"] = selected_stage2_layer
+            _detail.to_csv(_path, index=False, encoding="utf-8-sig")
         save_predictions_csv(t_tr, y_tr, y_rf_tr,
                              out_path=PRED_DIR / "train_pred_rf.csv")
         save_predictions_csv(t_va, y_va, y_rf_va,
@@ -1202,7 +1494,7 @@ def main():
     #   rf             : 单阶段 RandomForest 基线
     #   v42_baseline   : v4.2 基线模型 (仅 NILM_BASELINE_MODE=1 时使用)
     is_baseline_mode = _os.environ.get("NILM_BASELINE_MODE") == "1"
-    main_tag = "v42_baseline" if is_baseline_mode else "main"
+    main_tag = "v42_baseline" if is_baseline_mode else "main_raw"
     rows = []
     # 1. main 主模型 (train + val) - 单口径, 用训练标签 ON_THR_W=10W 评估
     rows += flatten_metrics_to_rows("train", main_tag,
@@ -1211,6 +1503,22 @@ def main():
     rows += flatten_metrics_to_rows("val", main_tag,
                                     cls_metrics=cls_va, reg_metrics=reg_va,
                                     extra=extra)
+    if not is_baseline_mode:
+        reg_scale_tr = compute_regression_metrics(y_tr, y_tr_scale)
+        reg_scale_va = compute_regression_metrics(y_va, y_va_scale)
+        rows += flatten_metrics_to_rows(
+            "train", "main_scale", cls_metrics=cls_tr, reg_metrics=reg_scale_tr,
+            extra={**extra, "scale": stage2_scale})
+        rows += flatten_metrics_to_rows(
+            "val", "main_scale", cls_metrics=cls_va, reg_metrics=reg_scale_va,
+            extra={**extra, "scale": stage2_scale})
+        rows += flatten_metrics_to_rows(
+            "train", "main", cls_metrics=cls_tr, reg_metrics=reg_selected_tr,
+            extra={**extra, "selected_layer": selected_stage2_layer})
+        rows += flatten_metrics_to_rows(
+            "val", "main", cls_metrics=cls_va, reg_metrics=reg_selected_va,
+            extra={**extra, "selected_layer": selected_stage2_layer})
+
     # 2. main_L4_calib (若 v6 L4 启用)
     if cls_calib_tr is not None and reg_calib_tr is not None:
         rows += flatten_metrics_to_rows("train", "main_L4_calib",

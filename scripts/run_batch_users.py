@@ -629,7 +629,9 @@ def aggregate_metrics(output_dir: Path, summary_dir: Path):
         "Accuracy", "Precision", "Recall", "F1", "AUC",
         "TN", "FP", "FN", "TP",
         "MAE_W", "RMSE_W", "SAE", "NDE",
-        "kWh_true", "kWh_pred", "kWh_err", "n_samples",
+        "kWh_true", "kWh_pred", "kWh_err",
+        "ON_kWh_true", "ON_kWh_pred", "ON_kWh_err", "ON_energy_bias",
+        "OFF_false_kWh", "n_samples",
     ]
     HEADER_COLS = ["user_id", "stage", "status"] + METRIC_COLS
     INT_COLS = {"TN", "FP", "FN", "TP", "n_samples"}

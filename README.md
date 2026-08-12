@@ -1919,11 +1919,17 @@ python scripts/run_user_pipeline.py \
 | `NILM_BASELINE_MODE=1` | v6.3 | 切换为 v4.2 基线训练模式 (跳过 L1/L4, 不覆盖主模型组件) |
 | `NILM_USER_GUARD_ENABLED=0/1/""` | **v13.1** | 用户级 D87 守卫开关 (由 run_user_pipeline.py 注入) |
 | `NILM_SPLITS_FILTER_SPEC=<json>` | **v13.2** | per-split 时段过滤规格 (由 run_user_pipeline.py 注入) |
-| `NILM_FIXED_TOP_COLS=<json-array>` | **2026-08-12** | 可复现实验开关：按给定顺序冻结电参量 Top-K；严格拒绝空数组、非字符串、重复列和缺失列。未设置时使用默认 train-only 选择 |
+| `NILM_FIXED_TOP_COLS=<json-array>` | **2026-08-12** | 旧兼容开关：同时冻结 Stage-1/Stage-2 manifest；严格拒绝空数组、非字符串、重复和缺失列 |
+| `NILM_FIXED_STAGE1_TOP_COLS=<json-array>` | **2026-08-12** | 仅冻结 Stage-1 manifest；优先级高于旧兼容开关 |
+| `NILM_FIXED_STAGE2_TOP_COLS=<json-array>` | **2026-08-12** | 仅冻结 Stage-2 manifest；优先级高于旧兼容开关 |
+| `NILM_STAGE2_ONLY_DATES=<json-array>` | **2026-08-12** | 日期必须已锚定到 train；仅供 Stage-2 train-ON/特征/LUT，Stage-1 样本、特征和阈值均排除这些日期 |
+| `NILM_ENABLE_NUISANCE_AUX=1` | **2026-08-12** | 从非目标 `pN` 分路生成仅训练可见的 nuisance 标签，训练总线侧辅助分类器；推理只消费辅助模型概率，抑制强度仅由 validation 选择，允许自动回退 `alpha=0` |
 
 数据源: `artifacts/aligned_15min.csv` (02 输出)
 
-**特征拟合隔离（2026-08-12 起）**：`03_train.py` 在特征工程前先解析最终 train/val/test（含 `NILM_SPLITS_FILTER_SPEC`），Top-25 标签相关性与温度功率 LUT 只在 train 上拟合，val/test 仅做 transform。bundle / `model_meta.json` 会保存 `feature_selection_source`、`feature_fit_dates` 和 `temp_power_lut_fit_source` 供审计；禁止再用全量 val/test 标签重选特征。
+**双视图与拟合隔离（2026-08-12 起）**：`03_train.py` 在特征工程前先解析最终 train/val/test（含 `NILM_SPLITS_FILTER_SPEC`）。Stage-1 在其独立 train 样本上按目标功率选择特征并拟合 scaler/LUT；Stage-2 只在独立 train-ON 样本上选择特征并拟合 scaler/LUT。`04_evaluate.py`/`05_inference.py` 按 bundle 中两个 manifest 对称重建视图，旧 bundle 自动退化为共享视图。bundle / `model_meta.json` 保存两套列名、训练日期和拟合来源；禁止使用 val/test/inference 标签重选特征。
+
+**Stage-2 校正选层**：按 validation 自然日留一交叉拟合 raw/scale/L4；候选须通过 `SAE≤20%`、`|ON_energy_bias|≤20%`、OFF 虚假能耗相对 raw 不显著增加，以及逐日 MAE/ON 偏差严格多数胜出，才可替代 raw。完整 fold 明细和门限写入 `model_meta.json`。
 
 #### C.3.3 `03b_train_v42_baseline.py` (v4.2 基线对照)
 
@@ -3083,7 +3089,10 @@ $ python scripts/run_batch_users.py --resume
 | `Accuracy` / `Precision` / `Recall` / `F1` / `AUC` | float | 分类指标, 若 status 非 ok 则 NaN |
 | `TN` / `FP` / `FN` / `TP` | int | 混淆矩阵 |
 | `MAE_W` / `RMSE_W` / `SAE` / `NDE` | float | 回归指标 |
-| `kWh_true` / `kWh_pred` / `kWh_err` | float | 能耗对比 |
+| `kWh_true` / `kWh_pred` / `kWh_err` | float | 全样本净能耗对比；`SAE` 不得脱离下列 ON/OFF 分项单独验收 |
+| `ON_kWh_true` / `ON_kWh_pred` / `ON_kWh_err` | float | 按当前用户 ON 阈值划分的真实 ON 区间能耗及有符号偏差 |
+| `ON_energy_bias` | float | `ON_kWh_err / ON_kWh_true`，有符号比例（例如 `-0.12` 表示少估 12%） |
+| `OFF_false_kWh` | float | 真实 OFF 区间的预测能耗；用于暴露被净 SAE 抵消的虚假能耗 |
 | `n_samples` | int | 该 stage 样本数 |
 
 **status 完整分类** (按判定顺序):
@@ -3100,7 +3109,7 @@ $ python scripts/run_batch_users.py --resume
 | `"bad_train_csv"` / `"bad_val_csv"` / `"bad_test_csv"` / `"bad_inference_csv"` | metrics CSV 格式异常 (缺 `split` 或 `model` 列) | 全 NaN |
 | `"no_train_rows"` / `"no_val_rows"` / `"no_test_rows"` / `"no_inference_rows"` | metrics CSV 里没有对应 stage 的行 | 全 NaN |
 | `"ok:main"` | 主模型 `main` 的指标 (train/val/test 3 stage 首选, inference 时若 main_final 缺失也会用 main) | 完整 |
-| `"ok:main_final"` | 最终模型 `main_final` (含 L4+L5 守卫) 的指标, **仅 inference stage 出现** | 完整 |
+| `"ok:main_final"` | 最终模型 `main_final`（按 bundle 的 `selected_stage2_layer` 路由 raw/scale/L4；仅有效多样性存在时才允许 L5）的指标，**仅 inference stage 出现** | 完整 |
 | `"ok:<其他模型名>"` | 优选模型都缺时, 退化取 metrics CSV 里第一个可用模型. 常见: `ok:rf` / `ok:fallback` / `ok:naive_mean` / `ok:naive_zero` / `ok:main_L4_calib` / `ok:nilm_ac_two_stage_v42` 等 | 完整 |
 
 **status 判定优先级** (aggregate_metrics 代码顺序):

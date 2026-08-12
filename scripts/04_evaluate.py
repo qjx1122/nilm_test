@@ -21,7 +21,8 @@ from common import (ARTIFACT_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PROJECT_VERSI
                     WEATHER_LATITUDE, WEATHER_LONGITUDE, WEATHER_CACHE_DIR,
                     SUMMER_TEMP_THRESHOLD, WINTER_TEMP_THRESHOLD,
                     get_logger, Timer)
-from feature_utils import build_features, assert_no_nan_features
+from feature_utils import assert_no_nan_features
+from model_feature_views import build_model_feature_views
 from metrics_utils import (build_daily_metrics_rows, save_daily_metrics_csv,
                            compute_raw_daily_counts)  # v13.16
 from postprocess import apply_postprocess
@@ -71,8 +72,11 @@ def main():
             log.error(f"模型文件不存在: {model_path}, 请先运行 03_train.py")
             return
         bundle = joblib.load(model_path)
-    scaler   = bundle["scaler"]
+    stage1_scaler = bundle.get("stage1_scaler", bundle["scaler"])
+    stage2_scaler = bundle.get("stage2_scaler", bundle["scaler"])
     clf      = bundle["clf"]
+    nuisance_clf = bundle.get("nuisance_clf")
+    nuisance_alpha = float(bundle.get("nuisance_alpha", 0.0))
     reg      = bundle["reg"]            # fallback 全局
     rf       = bundle["rf"]
     reg_low  = bundle.get("reg_low")
@@ -82,7 +86,9 @@ def main():
     quantile_alpha = float(bundle.get("quantile_alpha", 0.5))
     quantile_low   = float(bundle.get("quantile_low",  0.10))
     quantile_high  = float(bundle.get("quantile_high", 0.90))
-    top_cols = bundle["feat_cols"]
+    stage1_top_cols = bundle.get("stage1_feat_cols", bundle["feat_cols"])
+    stage2_top_cols = bundle.get("stage2_feat_cols", bundle["feat_cols"])
+    top_cols = stage1_top_cols  # 旧审计/基线兼容
     best_thr = float(bundle["best_thr"])
     # [一致性检查] 与 03_train.py 常量对齐:
     #   POST_MIN_ON=1 -> fallback=1 ✓ 一致
@@ -93,7 +99,8 @@ def main():
     model_ver = bundle.get("version", "v1")
     log.info(f"  模型训练于: {bundle.get('trained_at', 'unknown')}  ({model_ver})")
     log.info(f"  Stage-1 阈值: {best_thr:.3f}")
-    log.info(f"  特征维度: {len(bundle['feat_names'])}")
+    log.info(f"  特征维度: Stage-1={len(bundle.get('stage1_feat_names', bundle['feat_names']))}, "
+             f"Stage-2={len(bundle.get('stage2_feat_names', bundle['feat_names']))}")
     log.info(f"  后处理: min_on={post_min_on}, fill_short_off={post_fill_short_off}")
 
     # ---------- 2. 加载对齐数据 (与训练同口径) ----------
@@ -119,13 +126,12 @@ def main():
                      f"温度范围 [{weather_df['temperature_2m'].min():.1f}, "
                      f"{weather_df['temperature_2m'].max():.1f}] °C")
 
-    # v6: 从 bundle 取出训练时保存的 LUT, 注入漂移特征
-    temp_power_lut = bundle.get("temp_power_lut")
-    if temp_power_lut:
-        log.info(f"  [v6] 复用训练 LUT 构造漂移特征 "
-                 f"({len([k for k in temp_power_lut if isinstance(k, tuple)])} 个桶)")
-    X_df = build_features(df, top_cols, weather_df=weather_df,
-                          temp_power_lut=temp_power_lut)
+    # 按 bundle 构造 Stage-1/Stage-2 独立特征；旧模型自动退化为共享视图。
+    views = build_model_feature_views(df, bundle, weather_df=weather_df)
+    X_stage1_df, X_stage2_df = views.stage1_df, views.stage2_df
+    stage1_top_cols, stage2_top_cols = views.stage1_cols, views.stage2_cols
+    log.info(f"  独立特征 shape: Stage-1={X_stage1_df.shape}, "
+             f"Stage-2={X_stage2_df.shape}")
 
     # 季节标签
     if use_temp_based_season and weather_df is not None:
@@ -141,9 +147,12 @@ def main():
     else:
         season_labels_all = assign_season(df.index, use_temperature=False)
     # [v13.7] NaN 硬检测: X_df 若含 NaN 直接 raise, 避免后续 predict_proba 崩 sklearn
-    assert_no_nan_features(X_df, stage_name="evaluate", logger=log,
+    assert_no_nan_features(X_stage1_df, stage_name="evaluate/stage1", logger=log,
                            raise_on_nan=True)
-    X = X_df.values.astype(np.float32)
+    assert_no_nan_features(X_stage2_df, stage_name="evaluate/stage2", logger=log,
+                           raise_on_nan=True)
+    X_stage1 = X_stage1_df.values.astype(np.float32)
+    X_stage2 = X_stage2_df.values.astype(np.float32)
     y = df["y_ac"].values.astype(np.float32)
     # v6.12.6 单口径: 用 ON_THR_W 定义 ON 状态 (与训练标签同口径)
     # [v13.5 bug 修复] 优先从 bundle 读, 保证 v13.5 用户级覆盖 on_thr_w 后 04/03 一致
@@ -183,7 +192,8 @@ def main():
                 )
         except Exception as _e:
             log.warning(f"  [v13 per-split filter] 应用失败 ({_e}), 使用原切分")
-    X_te, y_te, s_te, t_te = X[idx_te], y[idx_te], state[idx_te], df.index[idx_te]
+    X1_te, X2_te = X_stage1[idx_te], X_stage2[idx_te]
+    y_te, s_te, t_te = y[idx_te], state[idx_te], df.index[idx_te]
     sea_te = season_labels_all[idx_te]   # v5 季节标签
     log.info(f"  Test 集: {len(y_te)} 条  ({t_te.min()} ~ {t_te.max()})  "
              f"ON 占比 {s_te.mean()*100:.2f}%")
@@ -194,21 +204,26 @@ def main():
 
     # ---------- 4. 推理 (v4: MoE 优先, 自动回退到全局 reg) ----------
     with Timer("模型推理 (test, MoE + 后处理)", log):
-        X_te_s = scaler.transform(X_te)
-        p_te = clf.predict_proba(X_te_s)[:, 1]
+        X1_te_s = stage1_scaler.transform(X1_te)
+        X2_te_s = stage2_scaler.transform(X2_te)
+        p_te = clf.predict_proba(X1_te_s)[:, 1]
+        if nuisance_clf is not None and nuisance_alpha > 0:
+            nuisance_prob = nuisance_clf.predict_proba(X1_te_s)[:, 1]
+            p_te = p_te * (1.0 - nuisance_alpha * nuisance_prob)
+            log.info(f"  使用总线侧 p3/p4 nuisance 抑制: alpha={nuisance_alpha:.2f}")
         raw_state_te = (p_te >= best_thr).astype(int)
 
         if moe is not None:
             # v5: 用 sea_te 季节标签取代时间戳
-            p_reg     = np.clip(moe.predict(X_te_s, sea_te, alpha=quantile_alpha), 0, None)
-            y_low_te  = np.clip(moe.predict(X_te_s, sea_te, alpha=quantile_low),   0, None)
-            y_high_te = np.clip(moe.predict(X_te_s, sea_te, alpha=quantile_high),  0, None)
+            p_reg     = np.clip(moe.predict(X2_te_s, sea_te, alpha=quantile_alpha), 0, None)
+            y_low_te  = np.clip(moe.predict(X2_te_s, sea_te, alpha=quantile_low),   0, None)
+            y_high_te = np.clip(moe.predict(X2_te_s, sea_te, alpha=quantile_high),  0, None)
             log.info(f"  使用季节分层 MoE 推理 ({model_ver})")
         else:
-            p_reg = np.clip(reg.predict(X_te_s), 0, None)
-            y_low_te  = (np.clip(reg_low.predict(X_te_s),  0, None)
+            p_reg = np.clip(reg.predict(X2_te_s), 0, None)
+            y_low_te  = (np.clip(reg_low.predict(X2_te_s),  0, None)
                          if reg_low  is not None else None)
-            y_high_te = (np.clip(reg_high.predict(X_te_s), 0, None)
+            y_high_te = (np.clip(reg_high.predict(X2_te_s), 0, None)
                          if reg_high is not None else None)
             log.info(f"  使用全局回归器 (老模型)")
 
@@ -249,8 +264,8 @@ def main():
         log.info("-" * 70)
         log.info("[v6.8] 计算 main_L4_calib 在 Test 集上的指标")
         # 构造 recent_signal: Top-1 列近 24h 滚动均值 (与 03_train.py 同口径)
-        if top_cols and top_cols[0] in df.columns:
-            top1 = df[top_cols[0]].astype(float)
+        if stage2_top_cols and stage2_top_cols[0] in df.columns:
+            top1 = df[stage2_top_cols[0]].astype(float)
             recent_24h_all = top1.rolling(window=96, min_periods=4,
                                           closed="left").mean().bfill().values
         else:
@@ -300,6 +315,19 @@ def main():
         elif residual_calib is None or not getattr(residual_calib, "_trained", False):
             log.info("[v6.8] bundle 不含已训练 L4 校正器, 跳过 main_L4_calib 指标")
 
+    _cal_meta = bundle.get("stage2_calibration", {})
+    _stage2_scale = float(_cal_meta.get("scale", 1.0))
+    y_pred_te_scale = y_pred_te * _stage2_scale
+    _selected_layer = bundle.get("selected_stage2_layer", "raw")
+    if _selected_layer == "l4" and y_pred_te_calib is not None and not args.no_calib:
+        y_pred_te_selected = y_pred_te_calib
+    elif _selected_layer == "scale":
+        y_pred_te_selected = y_pred_te_scale
+    else:
+        _selected_layer = "raw"
+        y_pred_te_selected = y_pred_te
+    log.info(f"  [Stage-2 selection] layer={_selected_layer}, scale={_stage2_scale:.6f}")
+
     # ---------- 5. 基线模型推理 (v5 统一框架) ----------
     # 截取 test 段的对齐 df 子集, 供基线 runner 使用
     df_te = df.iloc[idx_te].copy()
@@ -314,7 +342,8 @@ def main():
             baselines=baselines,
             df_aligned=df_te,
             top_cols=top_cols,
-            X_main_scaled=X_te_s,
+            X_main_scaled=X1_te_s,
+            X_stage2_scaled=X2_te_s,
             state_pred_main=pred_state_te,
             weather_df=weather_df.loc[(weather_df.index >= df_te.index.min()) &
                                       (weather_df.index <= df_te.index.max() +
@@ -339,7 +368,7 @@ def main():
              f"SAE={reg_te['SAE']*100:.2f}%, "
              f"kWh真/预={reg_te['kWh_true']:.2f}/{reg_te['kWh_pred']:.2f}")
     all_metric_rows += flatten_metrics_to_rows(
-        "test", "main", cls_metrics=cls_te, reg_metrics=reg_te,
+        "test", "main_raw", cls_metrics=cls_te, reg_metrics=reg_te,
         extra={"threshold": best_thr, "model_version": model_ver},
         source="evaluate",
     )
@@ -359,6 +388,23 @@ def main():
                    "note": "L4 残差校正后 (test 集 OOD 验证)"},
             source="evaluate",   # v6.11
         )
+
+    reg_te_scale = compute_regression_metrics(y_te, y_pred_te_scale)
+    all_metric_rows += flatten_metrics_to_rows(
+        "test", "main_scale", cls_metrics=cls_te, reg_metrics=reg_te_scale,
+        extra={"threshold": best_thr, "scale": _stage2_scale,
+               "note": "calibration fold 拟合的有界乘数"},
+        source="evaluate",
+    )
+    reg_te_selected = compute_regression_metrics(y_te, y_pred_te_selected)
+    all_metric_rows += flatten_metrics_to_rows(
+        "test", "main", cls_metrics=cls_te, reg_metrics=reg_te_selected,
+        extra={"threshold": best_thr, "selected_layer": _selected_layer,
+               "note": "独立 selection fold 选定的生产层"},
+        source="evaluate",
+    )
+    log.info(f"  [main_selected/{_selected_layer}] MAE={reg_te_selected['MAE_W']:.2f}W, "
+             f"SAE={reg_te_selected['SAE']*100:.2f}%")
 
     # 各基线指标
     for name, info in baseline_results.items():
@@ -380,16 +426,19 @@ def main():
         )
 
     # ---------- 7. 保存预测 + 指标 CSV ----------
-    save_predictions_csv(t_te, y_te, y_pred_te,
+    save_predictions_csv(t_te, y_te, y_pred_te_selected,
                          s_te, pred_state_te, p_te,
                          y_pred_low=y_low_te, y_pred_high=y_high_te,
                          out_path=PRED_DIR / "test_pred.csv")
     # [v6.8] 追加 main_L4_calib 列到 test_pred.csv 末尾, 便于 BI/Excel 横向对比
+    _tp = pd.read_csv(PRED_DIR / "test_pred.csv", encoding="utf-8-sig")
+    _tp["y_pred_main_raw_W"] = np.round(y_pred_te, 3)
+    _tp["y_pred_main_scale_W"] = np.round(y_pred_te_scale, 3)
+    _tp["selected_stage2_layer"] = _selected_layer
     if y_pred_te_calib is not None:
-        _tp = pd.read_csv(PRED_DIR / "test_pred.csv", encoding="utf-8-sig")
         _tp["y_pred_main_L4_calib_W"] = np.round(y_pred_te_calib, 3)
         _tp["residual_main_L4_calib_W"] = np.round(y_pred_te_calib - y_te, 3)
-        _tp.to_csv(PRED_DIR / "test_pred.csv", index=False, encoding="utf-8-sig")
+    _tp.to_csv(PRED_DIR / "test_pred.csv", index=False, encoding="utf-8-sig")
     log.info(f"  ✓ {PRED_DIR / 'test_pred.csv'}")
 
     # 每个基线单独存预测明细 (便于精细分析)
@@ -428,7 +477,7 @@ def main():
         _te_dates = pd.to_datetime(pd.Series(t_te)).dt.strftime("%Y-%m-%d").unique()
         _te_labels = {d: "test" for d in _te_dates}
         _all_daily_rows += build_daily_metrics_rows(
-            t_te, y_te, y_pred_te, s_te, pred_state_te,
+            t_te, y_te, y_pred_te_selected, s_te, pred_state_te,
             split_name="test", on_thr_w=on_thr_eval, p_on=p_te,
             date_labels=_te_labels,
             model_name="main_final", extra=_common_extra,
@@ -483,7 +532,7 @@ def main():
     # 兼容: 保留 y_rf_te 给后续可视化用
     y_rf_te = baseline_results.get("rf", {}).get("y_pred")
     if y_rf_te is None:
-        y_rf_te = np.clip(rf.predict(X_te_s), 0, None)
+        y_rf_te = np.clip(rf.predict(X1_te_s), 0, None)
 
     # ---------- 8. 汇总 train/val/test 指标到一张表 (v6.11 修复版) ----------
     # train_val_metrics 与 test_metrics 是 append 累积历史 (含 timestamp + project_version
@@ -584,8 +633,9 @@ def main():
         log.info(f"  ✓ {fig_path}")
 
         # 特征重要性
+        _reg_feat_names = bundle.get("stage2_feat_names", bundle["feat_names"])
         imp = pd.Series(reg.feature_importances_,
-                        index=bundle["feat_names"]).sort_values().tail(20)
+                        index=_reg_feat_names).sort_values().tail(20)
         plt.figure(figsize=(8, 7))
         imp.plot.barh(color="#3a7ca5")
         plt.title("Top-20 特征重要性 (回归阶段)")

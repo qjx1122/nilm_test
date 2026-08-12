@@ -57,8 +57,8 @@ from common import (INFER_BUS_CSV, INFER_BR_CSV,    # v6.12.6+v6.15.0 推理路�
                     SUMMER_TEMP_THRESHOLD, WINTER_TEMP_THRESHOLD,
                     setup_chinese_font, get_logger, Timer)
 from feature_utils import (load_bus_csv, load_branch_csv,
-                           resample_and_align, build_features,
-                           assert_no_nan_features)
+                           resample_and_align, assert_no_nan_features)
+from model_feature_views import build_model_feature_views
 from postprocess import apply_postprocess
 from weather_utils import get_weather_for_period
 from expert_utils import assign_season
@@ -142,8 +142,11 @@ def main():
     # ---------- 2. 加载主模型 ----------
     with Timer("加载主模型", log):
         bundle = joblib.load(model_path)
-        scaler   = bundle["scaler"]
+        stage1_scaler = bundle.get("stage1_scaler", bundle["scaler"])
+        stage2_scaler = bundle.get("stage2_scaler", bundle["scaler"])
         clf      = bundle["clf"]
+        nuisance_clf = bundle.get("nuisance_clf")
+        nuisance_alpha = float(bundle.get("nuisance_alpha", 0.0))
         reg      = bundle["reg"]
         reg_low  = bundle.get("reg_low")
         reg_high = bundle.get("reg_high")
@@ -151,7 +154,9 @@ def main():
         quantile_alpha = float(bundle.get("quantile_alpha", 0.5))
         quantile_low   = float(bundle.get("quantile_low",  0.10))
         quantile_high  = float(bundle.get("quantile_high", 0.90))
-        top_cols = bundle["feat_cols"]
+        stage1_top_cols = bundle.get("stage1_feat_cols", bundle["feat_cols"])
+        stage2_top_cols = bundle.get("stage2_feat_cols", bundle["feat_cols"])
+        top_cols = stage1_top_cols
         best_thr = float(bundle["best_thr"])
         # [一致性检查] 与 03_train.py 常量对齐:
         #   POST_MIN_ON=1 -> fallback=1 ✓ 一致
@@ -171,7 +176,8 @@ def main():
         log.info(f"  总线 shape={bus.shape}")
     # v6.12.a: 排除由 resample_and_align 自动生成的 5min 极值衍生列
     _DERIVED_SUFFIXES = ("_max5", "_min5", "_absmax5")
-    missing = [c for c in top_cols
+    required_top_cols = list(dict.fromkeys(stage1_top_cols + stage2_top_cols))
+    missing = [c for c in required_top_cols
                if c not in bus.columns and not c.endswith(_DERIVED_SUFFIXES)]
     if missing:
         log.error(f"总线 CSV 缺少模型所需列: {missing[:5]}... (共 {len(missing)} 列)")
@@ -205,10 +211,10 @@ def main():
     # ---------- 4. 对齐 + 特征工程 ----------
     with Timer("重采样 + 对齐 + 特征工程", log):
         if has_label:
-            df = resample_and_align(bus, branch, keep_cols=top_cols)
+            df = resample_and_align(bus, branch, keep_cols=required_top_cols)
             log.info(f"  对齐后样本(含标签): {len(df)}")
         else:
-            df = resample_and_align(bus, branch_df=None, keep_cols=top_cols)
+            df = resample_and_align(bus, branch_df=None, keep_cols=required_top_cols)
             log.info(f"  对齐后样本(无标签): {len(df)}")
         if len(df) == 0:
             log.error("对齐后无数据, 请检查时间范围与字段")
@@ -230,14 +236,12 @@ def main():
                          f"温度范围 [{weather_df['temperature_2m'].min():.1f}, "
                          f"{weather_df['temperature_2m'].max():.1f}] °C")
 
-        # v6: 从 bundle 取出训练时保存的 LUT, 注入漂移特征
-        temp_power_lut = bundle.get("temp_power_lut")
-        if temp_power_lut:
-            log.info(f"  [v6] 复用训练 LUT 构造漂移特征 "
-                     f"({len([k for k in temp_power_lut if isinstance(k, tuple)])} 个桶)")
-        X_df = build_features(df, top_cols, weather_df=weather_df,
-                              temp_power_lut=temp_power_lut)
-        log.info(f"  特征 shape={X_df.shape}")
+        views = build_model_feature_views(df, bundle, weather_df=weather_df)
+        X_stage1_df, X_stage2_df = views.stage1_df, views.stage2_df
+        stage1_top_cols, stage2_top_cols = views.stage1_cols, views.stage2_cols
+        temp_power_lut = views.stage1_lut  # 漂移审计延续 Stage-1 视图
+        log.info(f"  独立特征 shape: Stage-1={X_stage1_df.shape}, "
+                 f"Stage-2={X_stage2_df.shape}")
         
         # v6 L2: 漂移检测告警
         if temp_power_lut and weather_df is not None:
@@ -277,23 +281,31 @@ def main():
     with Timer("主模型推理 (MoE + 后处理)", log):
         # [v13.7] NaN 硬检测: X_df 有 NaN 会让 sklearn GBM 直接崩 (270758 案例根因)
         # 检测到会 WARN 打印列名/时间戳定位 + 主动 raise, 避免掉进 sklearn 报错栈
-        assert_no_nan_features(X_df, stage_name="inference", logger=log,
+        assert_no_nan_features(X_stage1_df, stage_name="inference/stage1", logger=log,
                                raise_on_nan=True)
-        X = X_df.values.astype(np.float32)
-        X_s = scaler.transform(X)
-        p_on = clf.predict_proba(X_s)[:, 1]
+        assert_no_nan_features(X_stage2_df, stage_name="inference/stage2", logger=log,
+                               raise_on_nan=True)
+        X_stage1 = X_stage1_df.values.astype(np.float32)
+        X_stage2 = X_stage2_df.values.astype(np.float32)
+        X1_s = stage1_scaler.transform(X_stage1)
+        X2_s = stage2_scaler.transform(X_stage2)
+        p_on = clf.predict_proba(X1_s)[:, 1]
+        if nuisance_clf is not None and nuisance_alpha > 0:
+            nuisance_prob = nuisance_clf.predict_proba(X1_s)[:, 1]
+            p_on = p_on * (1.0 - nuisance_alpha * nuisance_prob)
+            log.info(f"  使用总线侧 p3/p4 nuisance 抑制: alpha={nuisance_alpha:.2f}")
         raw_state = (p_on >= best_thr).astype(int)
 
         if moe is not None:
-            p_reg  = np.clip(moe.predict(X_s, season_labels, alpha=quantile_alpha), 0, None)
-            y_low  = np.clip(moe.predict(X_s, season_labels, alpha=quantile_low),   0, None)
-            y_high = np.clip(moe.predict(X_s, season_labels, alpha=quantile_high),  0, None)
+            p_reg  = np.clip(moe.predict(X2_s, season_labels, alpha=quantile_alpha), 0, None)
+            y_low  = np.clip(moe.predict(X2_s, season_labels, alpha=quantile_low),   0, None)
+            y_high = np.clip(moe.predict(X2_s, season_labels, alpha=quantile_high),  0, None)
             log.info(f"  使用季节分层 MoE 推理 ({model_ver})")
         else:
-            p_reg = np.clip(reg.predict(X_s), 0, None)
-            y_low  = (np.clip(reg_low.predict(X_s),  0, None)
+            p_reg = np.clip(reg.predict(X2_s), 0, None)
+            y_low  = (np.clip(reg_low.predict(X2_s),  0, None)
                       if reg_low  is not None else None)
-            y_high = (np.clip(reg_high.predict(X_s), 0, None)
+            y_high = (np.clip(reg_high.predict(X2_s), 0, None)
                       if reg_high is not None else None)
             log.info(f"  使用全局回归器 (老模型)")
 
@@ -517,8 +529,8 @@ def main():
         log.info("-" * 70)
         log.info("[L4] 应用残差校正层")
         # 计算近期信号 (与训练时一致)
-        if top_cols and top_cols[0] in df.columns:
-            top1 = df[top_cols[0]].astype(float)
+        if stage2_top_cols and stage2_top_cols[0] in df.columns:
+            top1 = df[stage2_top_cols[0]].astype(float)
             recent_24h = top1.rolling(window=96, min_periods=4,
                                       closed="left").mean().bfill().values
         else:
@@ -540,6 +552,20 @@ def main():
         elif residual_calib is None or not getattr(residual_calib, "_trained", False):
             log.info("[L4] bundle 不含已训练 L4 校正器, 跳过残差校正")
 
+    _cal_meta = bundle.get("stage2_calibration", {})
+    _stage2_scale = float(_cal_meta.get("scale", 1.0))
+    y_pred_after_scale = y_pred_raw_main * _stage2_scale
+    _selected_layer = bundle.get("selected_stage2_layer", "raw")
+    if _selected_layer == "l4" and use_calib and getattr(residual_calib, "_trained", False):
+        y_pred = y_pred_after_L4.copy()
+    elif _selected_layer == "scale":
+        y_pred = y_pred_after_scale.copy()
+    else:
+        _selected_layer = "raw"
+        y_pred = y_pred_raw_main.copy()
+    log.info(f"[Stage-2 selection] 独立 selection fold 选择 {_selected_layer}; "
+             f"scale={_stage2_scale:.6f}")
+
     # ---------- 6. 基线模型推理 (v5 新增) ----------
     baseline_results = {}
     if baselines:
@@ -552,7 +578,8 @@ def main():
                 baselines=baselines,
                 df_aligned=df,
                 top_cols=top_cols,
-                X_main_scaled=X_s,
+                X_main_scaled=X1_s,
+                X_stage2_scaled=X2_s,
                 state_pred_main=state_pred,
                 weather_df=weather_df,
             )
@@ -593,6 +620,10 @@ def main():
         # 否则用 fallback 别名 (MoE 全局兜底)
         if fb_name is None and "fallback" in baseline_results:
             fb_name = "fallback"
+        if (fb_name == "fallback" and
+                bundle.get("fallback_same_as_active_expert", False)):
+            log.info("[L5] fallback 与唯一活跃季节 expert 同源同算法，跳过无多样性混合")
+            fb_name = None
 
         if fb_name is not None:
             log.info("-" * 70)
@@ -609,7 +640,8 @@ def main():
             switcher = ModelSwitcher(main_bundle=bundle, fallback_bundle={},
                                      logger=log)
             # v6.9: 把 L4 实际启用状态传给 L5, 决定主模型权重保留多少
-            calib_active = bool(use_calib and residual_calib is not None and
+            calib_active = bool(_selected_layer == "l4" and use_calib and
+                                residual_calib is not None and
                                 getattr(residual_calib, "_trained", False))
             switch_decision = switcher.decide(drift_report,
                                               calib_active=calib_active)
@@ -641,6 +673,8 @@ def main():
         "p_on_main": np.round(p_on, 4),
         "y_pred_W_main_raw": np.round(y_pred_raw_main, 3),
         "y_pred_W_main_L4_calib": np.round(y_pred_after_L4, 3),
+        "y_pred_W_main_scale": np.round(y_pred_after_scale, 3),
+        "selected_stage2_layer": np.repeat(_selected_layer, len(df)),
         **({"state_true": s_true} if has_label else {}),
         **({"y_pred_low_W_main":  np.round(y_low,  3)} if y_low  is not None else {}),
         **({"y_pred_high_W_main": np.round(y_high, 3)} if y_high is not None else {}),
@@ -705,7 +739,16 @@ def main():
                 source="inference",   # v6.11
             )
 
-        # ---- main_final: L4 + L5 (生产实际输出, 与下游 CSV 主列一致) ----
+        reg_main_scale = compute_regression_metrics(y_true, y_pred_after_scale)
+        all_metric_rows += flatten_metrics_to_rows(
+            "inference", "main_scale",
+            cls_metrics=cls_main, reg_metrics=reg_main_scale,
+            extra={**extra_base, "scale": _stage2_scale,
+                   "note": "calibration fold 拟合的有界乘数"},
+            source="inference",
+        )
+
+        # ---- main_final: 独立 selection 选层后，可选 L5（主生产输出） ----
         # 若 L5 未触发 (主权重=1) 且 L4 未启用, 则 main_final == main, 仍单独输出便于对齐
         reg_main_final = compute_regression_metrics(y_true, y_pred)
         log.info(f"  [main_final]        回归: MAE={reg_main_final['MAE_W']:.2f}W, "
@@ -720,7 +763,8 @@ def main():
         all_metric_rows += flatten_metrics_to_rows(
             "inference", "main_final",
             cls_metrics=cls_main, reg_metrics=reg_main_final,
-            extra={**extra_base, "note": f"生产输出 (L4+L5); {l5_note}"},
+            extra={**extra_base, "selected_layer": _selected_layer,
+                   "note": f"独立 selection 选层={_selected_layer}; {l5_note}"},
             source="inference",   # v6.11
         )
 

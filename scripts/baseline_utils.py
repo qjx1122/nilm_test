@@ -197,7 +197,8 @@ class BaselineRunner:
                 top_cols: list,
                 X_main_scaled: np.ndarray,
                 state_pred_main: np.ndarray,
-                weather_df: pd.DataFrame = None) -> dict:
+                weather_df: pd.DataFrame = None,
+                X_stage2_scaled: np.ndarray = None) -> dict:
         """
         参数:
             baselines       : 用户指定的基线列表 (别名 + 路径混合)
@@ -220,6 +221,7 @@ class BaselineRunner:
             y_pred = self._predict_one(
                 model, df_aligned, top_cols, X_main_scaled,
                 state_pred_main, weather_df=weather_df,
+                X_stage2_scaled=X_stage2_scaled,
             )
             if y_pred is not None:
                 results[model.name] = {"y_pred": y_pred, "model": model}
@@ -230,7 +232,8 @@ class BaselineRunner:
                      top_cols: list,
                      X_main_scaled: np.ndarray,
                      state_pred_main: np.ndarray,
-                     weather_df: pd.DataFrame = None) -> np.ndarray | None:
+                     weather_df: pd.DataFrame = None,
+                     X_stage2_scaled: np.ndarray = None) -> np.ndarray | None:
         n = len(df_aligned)
 
         # ---- 内置 naive ----
@@ -248,7 +251,8 @@ class BaselineRunner:
 
         # ---- MoE Fallback (全局回归, 应用主模型的 ON 门控) ----
         if model.kind == "fallback":
-            y_reg = np.clip(model.predictor.predict(X_main_scaled), 0, None)
+            X_reg = X_stage2_scaled if X_stage2_scaled is not None else X_main_scaled
+            y_reg = np.clip(model.predictor.predict(X_reg), 0, None)
             return state_pred_main.astype(float) * y_reg
 
         # ---- 外部 pkl (独立特征工程) ----
