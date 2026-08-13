@@ -1,5 +1,22 @@
 {
-  "_comment_": "[v12/v13/v13.5/v13.16] 每用户批量配置示例. 完整支持 6 类字段: (1) time_filter 时段过滤 - 全局 train/infer 数据加载阶段的 include/exclude (v12, 配置在顶层 train:/infer: 字段); (2) d87 守卫开关 - guard_enabled 字段 (v13); (3) per-split time_filter - splits.train/val/test 三集独立 include/exclude (v13); (4) 目标分路列名 - target_col 字段 (v13/v13.4-fix/v13.16, 格式 pN 或 pA+pB[+pC...], N ≥ 0 整数, 优先级高于文件名 -Ch{N}- 反推); (5) [v13.5 新增] common 常量覆盖 - 9 个字段 (on_thr_w/split_ratios/split_strategy/post_min_on/post_fill_short_off/weather_latitude/weather_longitude/use_weather_features/use_temp_based_season), 未指定则用 common.py 默认; (6) _default 兜底. 用 --time-filter-config 传给 run_batch_users.py.",
+  "_comment_": "[v12/v13/v13.5/v13.16/v15] 每用户批量配置示例. 完整支持 7 类字段: (1) time_filter 时段过滤 - 全局 train/infer 数据加载阶段的 include/exclude (v12, 配置在顶层 train:/infer: 字段); (2) d87 守卫开关 - guard_enabled 字段 (v13); (3) per-split time_filter - splits.train/val/test 三集独立 include/exclude (v13); (4) 目标分路列名 - target_col 字段 (v13/v13.4-fix/v13.16, 格式 pN 或 pA+pB[+pC...], N ≥ 0 整数, 优先级高于文件名 -Ch{N}- 反推); (5) [v13.5 新增] common 常量覆盖 - 9 个字段 (on_thr_w/split_ratios/split_strategy/post_min_on/post_fill_short_off/weather_latitude/weather_longitude/use_weather_features/use_temp_based_season), 未指定则用 common.py 默认; (6) [v15 新增] 多算法运行模式 - algorithms 字段 (mode=single|multi|all + selected 列表, 详见下方 _v15_algorithms_note_); (7) _default 兜底. 用 --time-filter-config 传给 run_batch_users.py.",
+
+  "_v15_algorithms_note_": "[v15] 多算法运行模式配置说明: 支持三种自定义运行模式 - (a) single: 指定单模型执行 (selected 取第一个, 如 'rf' 只跑 RF 基线); (b) multi: 多模型选择性执行 (selected 列表原样执行, 如 ['main','rf'] 跑主模型+RF 基线); (c) all: 全部模型遍历执行 (注册表内全部算法 main,rf,v14 按序执行, 忽略 selected). 优先级: CLI (--algorithms / --algo-mode) > 本配置 > 内置默认 (main+rf, 与重构前行为一致). 若未配置 algorithms 但用户 v14 增强开关开启, 默认列表自动追加 v14. 产物隔离: 每个算法独立归档到 artifacts/trains/<user>/<algo>/ 与 artifacts/infers/<user>/<algo>/, 模型资产归档到 models/<user_id>/<algo>/. 新算法通过 scripts/algorithms/ 统一接口注册后即可被 selected 引用.",
+
+  "_v15_algorithms_example_single_": {
+    "_note_": "[v15 single 示例] 仅执行 RF 基线算法 (跳过主模型/v14).",
+    "algorithms": {"mode": "single", "selected": ["rf"]}
+  },
+
+  "_v15_algorithms_example_multi_": {
+    "_note_": "[v15 multi 示例] 选择性执行 主模型 + v14 两个算法.",
+    "algorithms": {"mode": "multi", "selected": ["main", "v14"]}
+  },
+
+  "_v15_algorithms_example_all_": {
+    "_note_": "[v15 all 示例] 全部算法遍历执行 (main -> rf -> v14).",
+    "algorithms": {"mode": "all"}
+  },
 
   "_v1316_composite_target_col_note_": "[v13.16] target_col 复合语义: 若填写 'p1+p2' 或 'p1+p2+p3', 加载分路 CSV 时自动新增一列 (列名就是复合字符串), 值 = 分量按行求和 (skipna=False, 任一分量缺则该行 NaN 传播). 分量正则: 每个 pN 须 N ≥ 0 整数. 空白/大小写不敏感 (P1 + p2 -> p1+p2). 防呆: 重复分量 (p1+p1) 拒绝. 用户示例 p1=[24,16,16,16] p2=[8,0,0,8] 配 'p1+p2' -> [32,16,16,24]. 向后兼容: 单列 'p1' 完全不触发物化. 使用场景: 同一空调有多个分路 (主机+辅热/多室内机), 需合并作为总标签.",
 

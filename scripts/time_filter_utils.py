@@ -1028,6 +1028,83 @@ def splits_spec_summary(splits_spec: Optional[dict]) -> str:
 
 
 # ============================================================
+# [v15] 多算法运行模式配置 (time_filters 配置扩展: algorithms 字段)
+# ============================================================
+# 配置结构 (用户级 或 _default 级, 与既有字段同一套回退语义):
+#   "algorithms": {
+#       "mode": "single" | "multi" | "all",   # 缺省按 selected 列表长度推定
+#       "selected": ["main", "rf", ...],      # single 取第一个, multi 取整个列表
+#       "<algo_name>": {...}                  # [预留] 算法级私有覆盖 (未来扩展)
+#   }
+# 优先级: CLI (--algorithms/--algo-mode) > 本配置 > 内置默认 (main+rf).
+# 解析实现统一收敛在 scripts/algorithms/registry.py, 本文件只负责"从配置取数".
+def get_user_algorithms_config(config: dict, user_id: str) -> Optional[dict]:
+    """[v15] 从 time_filter_config 取出 (user_id) 的 algorithms 运行模式配置.
+
+    回退语义与 get_user_stage_spec 一致: 用户级缺失时回退 _default;
+    非 dict / 缺失 -> None (走内置默认).
+    """
+    if not isinstance(config, dict):
+        return None
+    user_cfg = config.get(user_id)
+    if user_cfg is None:
+        user_cfg = config.get("_default")
+    if not isinstance(user_cfg, dict):
+        return None
+    algo_cfg = user_cfg.get("algorithms")
+    if not isinstance(algo_cfg, dict):
+        return None
+    return algo_cfg
+
+
+def get_user_algorithms_selection(
+    config: dict, user_id: str,
+    cli_algorithms: Optional[str] = None,
+    cli_mode: Optional[str] = None,
+    v14_hint: bool = False,
+):
+    """[v15] 解析该用户最终执行的算法列表与运行模式 (三种模式统一入口).
+
+    Args:
+        config:         time_filter_config dict (可为 None / 空)
+        user_id:        用户文件夹名
+        cli_algorithms: CLI --algorithms (逗号分隔, None = 不覆盖)
+        cli_mode:       CLI --algo-mode (single/multi/all, None = 不覆盖)
+        v14_hint:       True = 用户 v14 增强开关已开启 (无显式配置时追加 v14)
+
+    Returns:
+        (selected_names: list[str], effective_mode: str, warnings: list[str])
+    """
+    try:
+        from algorithms.registry import resolve_algorithm_selection
+    except ImportError:
+        # 降级: algorithms 包缺失时按旧行为 (main+rf)
+        return ["main", "rf"], "multi", []
+    algo_config = get_user_algorithms_config(config or {}, user_id)
+    return resolve_algorithm_selection(
+        algo_config=algo_config,
+        cli_algorithms=cli_algorithms,
+        cli_mode=cli_mode,
+        v14_hint=bool(v14_hint),
+    )
+
+
+def algorithms_config_summary(algo_cfg: Optional[dict]) -> str:
+    """[v15] 配置内 algorithms 字段的人类可读摘要 (日志用)."""
+    if not isinstance(algo_cfg, dict):
+        return "(未配置)"
+    mode = str(algo_cfg.get("mode", "") or "")
+    sel = algo_cfg.get("selected")
+    if isinstance(sel, (list, tuple)):
+        sel_s = ",".join(str(x) for x in sel)
+    elif isinstance(sel, str):
+        sel_s = sel
+    else:
+        sel_s = ""
+    return f"mode={mode or '(自动)'}, selected={sel_s or '(默认)'}"
+
+
+# ============================================================
 # 单元测试 (直接 python time_filter_utils.py 运行)
 # ============================================================
 if __name__ == "__main__":
