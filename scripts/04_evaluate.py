@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from common import (ARTIFACT_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PROJECT_VERSION,
+from common import (ARTIFACT_DIR, MODEL_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PROJECT_VERSION,
                     BUS_CSV, BR_CSV,     # v13.16 daily raw counts 需要
                     ON_THR_W,             # v6.12.6 单一阈值
                     setup_chinese_font,
@@ -38,12 +38,16 @@ from metrics_utils import (compute_classification_metrics,
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="测试集评估 (v5: 多基线, v6.8: + L4 校正后指标)")
+    p = argparse.ArgumentParser(description="测试集评估 (v5: 多基线, v6.8: + L4 校正后指标, v15: + 算法解耦)")
     p.add_argument("--model", type=str, default=str(MODEL_PKL),
                    help="主模型路径")
     p.add_argument("--baseline", nargs="*",
                    default=["rf"],   # 默认带 RF 基线对比
                    help="基线模型 (rf/fallback/naive_mean/naive_zero/<.pkl>)")
+    p.add_argument("--no-baseline", action="store_true",
+                   help="[v15] 不运行任何基线对比 (多算法解耦: main 算法独立评估时用)")
+    p.add_argument("--algo", type=str, default="main", choices=["main", "rf"],
+                   help="[v15 算法解耦] 评估目标算法: main=主模型, rf=RF 基线独立评估")
     p.add_argument("--no-calib", action="store_true",
                    help="禁用 L4 残差校正后指标计算 (即使模型 bundle 含 calibrator)")
     return p.parse_args()
@@ -53,23 +57,71 @@ chosen_font = setup_chinese_font()
 log.info(f"matplotlib 字体: {chosen_font or '系统无中文字体'}")
 
 
+def _run_rf_evaluation(bundle, X_te, y_te, s_te, t_te, on_thr_eval) -> int:
+    """[v15 算法解耦] RF 基线独立评估路径.
+
+    仅执行 RF 预测 + test_pred_rf.csv + 指标行, 不触碰任何主模型专属环节
+    (Stage-1 / MoE / L4 / 可视化), 保证 rf 算法与 main 算法产物完全隔离.
+    """
+    rf = bundle.get("rf")
+    if rf is None:
+        log.error("[v15] rf 算法评估失败: bundle 不含 'rf' 模型对象 "
+                  "(请用 NILM_ALGO_SELECT=rf 训练或使用旧版合并 bundle)")
+        return 1
+    scaler = bundle["scaler"]
+    X_te_s = scaler.transform(X_te)
+    with Timer("RF 基线推理 (test)", log):
+        y_rf = np.clip(rf.predict(X_te_s), 0, None)
+    s_rf = (y_rf >= on_thr_eval).astype(int)
+    cls_rf = compute_classification_metrics(s_te, s_rf, y_rf)
+    reg_rf = compute_regression_metrics(y_te, y_rf)
+    log.info("-" * 70)
+    log.info("[v15] RF 基线独立评估 (test)")
+    log.info(f"  分类: F1={cls_rf['F1']:.4f}, Precision={cls_rf['Precision']:.4f}, "
+             f"Recall={cls_rf['Recall']:.4f}")
+    log.info(f"  回归: MAE={reg_rf['MAE_W']:.2f}W, SAE={reg_rf['SAE']*100:.2f}%, "
+             f"kWh真/预={reg_rf['kWh_true']:.2f}/{reg_rf['kWh_pred']:.2f}")
+    save_predictions_csv(t_te, y_te, y_rf,
+                         out_path=PRED_DIR / "test_pred_rf.csv")
+    log.info(f"  ✓ {PRED_DIR / 'test_pred_rf.csv'}")
+    rows = flatten_metrics_to_rows(
+        "test", "rf", cls_metrics=cls_rf, reg_metrics=reg_rf,
+        extra={"note": f"v15 独立 RF 基线评估, ON 阈值={on_thr_eval:.1f}W"},
+        source="evaluate",
+    )
+    merged_te = save_metrics_csv(rows, METRIC_DIR / "test_metrics.csv", append=True)
+    log.info(f"  ✓ {METRIC_DIR / 'test_metrics.csv'}  "
+             f"(本次追加 {len(rows)} 行, 文件累计 {len(merged_te)} 行)")
+    log.info("=" * 70)
+    log.info("Step 4 评估完成 (algo=rf)")
+    return 0
+
+
 def main():
     args = parse_args()
     from pathlib import Path
     model_path = Path(args.model)
-    baselines = list(args.baseline) if args.baseline else []
+    baselines = [] if args.no_baseline else (list(args.baseline) if args.baseline else [])
+
+    # [v15 算法解耦] rf 算法: 优先加载自包含 rf_bundle.pkl (03_train NILM_ALGO_SELECT=rf 产出);
+    # 缺失时回退主模型 bundle (旧版合并训练布局, bundle 内含 'rf' 字段).
+    if args.algo == "rf" and not model_path.exists():
+        _rf_bundle = MODEL_DIR / "rf_bundle.pkl"
+        if _rf_bundle.exists():
+            log.info(f"  [v15] rf 算法评估: 切换模型路径 -> {_rf_bundle}")
+            model_path = _rf_bundle
 
     log.info("=" * 70)
-    log.info("Step 4: 测试集评估 (v5: 多基线)")
+    log.info(f"Step 4: 测试集评估 (v5: 多基线, v15: algo={args.algo})")
     log.info(f"  主模型    : {model_path}")
-    log.info(f"  基线对比  : {baselines if baselines else '<仅主模型>'}")
+    log.info(f"  基线对比  : {baselines if baselines else '<无>'}")
     log.info("=" * 70)
 
     # ---------- 1. 加载模型 ----------
     with Timer(f"加载模型 {model_path.name}", log):
         if not model_path.exists():
-            log.error(f"模型文件不存在: {model_path}, 请先运行 03_train.py")
-            return
+            log.error(f"模型文件不存在: {model_path}, 请先运行训练")
+            return 1
         bundle = joblib.load(model_path)
     scaler   = bundle["scaler"]
     clf      = bundle["clf"]
@@ -191,6 +243,10 @@ def main():
     mc = pd.to_datetime(t_te).to_period("M").value_counts().sort_index()
     log.info(f"  Test 月份分布: " +
              ", ".join([f"{str(k)}={v}" for k, v in mc.items()]))
+
+    # ---------- 4. [v15 算法解耦] rf 算法独立评估 (提前分流) ----------
+    if args.algo == "rf":
+        return _run_rf_evaluation(bundle, X_te, y_te, s_te, t_te, on_thr_eval)
 
     # ---------- 4. 推理 (v4: MoE 优先, 自动回退到全局 reg) ----------
     with Timer("模型推理 (test, MoE + 后处理)", log):
@@ -481,8 +537,9 @@ def main():
         log.info("=" * 70)
 
     # 兼容: 保留 y_rf_te 给后续可视化用
+    # [v15 算法解耦] main-only 训练产出的 bundle 中 "rf" 键为 None, 需防御
     y_rf_te = baseline_results.get("rf", {}).get("y_pred")
-    if y_rf_te is None:
+    if y_rf_te is None and rf is not None:
         y_rf_te = np.clip(rf.predict(X_te_s), 0, None)
 
     # ---------- 8. 汇总 train/val/test 指标到一张表 (v6.11 修复版) ----------
@@ -565,8 +622,9 @@ def main():
         axes[0].legend(loc="upper right"); axes[0].grid(alpha=0.3)
 
         axes[1].plot(t_te, y_te, "k-", lw=1.2, label="真实值")
-        axes[1].plot(t_te, y_rf_te, "b-", lw=1.2, alpha=0.7,
-                     label="预测 RF基线")
+        if y_rf_te is not None:   # [v15] main-only bundle 无 RF 时跳过该子图
+            axes[1].plot(t_te, y_rf_te, "b-", lw=1.2, alpha=0.7,
+                         label="预测 RF基线")
         axes[1].set_ylabel("功率 (W)")
         axes[1].set_title("基线对照 - 单阶段 RandomForest")
         axes[1].legend(loc="upper right"); axes[1].grid(alpha=0.3)
@@ -599,4 +657,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys04
+    _sys04.exit(main() or 0)

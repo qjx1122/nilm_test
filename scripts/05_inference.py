@@ -49,7 +49,7 @@ import pandas as pd
 
 from common import (INFER_BUS_CSV, INFER_BR_CSV,    # v6.12.6+v6.15.0 推理路径独立
                     BUS_CSV, BR_CSV,                # 兼容: 训练路径仍然可读
-                    MODEL_PKL, PRED_DIR, METRIC_DIR,
+                    MODEL_PKL, MODEL_DIR, PRED_DIR, METRIC_DIR,
                     ARTIFACT_DIR,
                     ON_THR_W,             # v6.12.6 单一阈值
                     TARGET_COL,           # v13.16 复合列物化需要
@@ -79,6 +79,70 @@ from metrics_utils import (compute_classification_metrics,
 log = get_logger("infer")
 
 
+def _run_rf_inference(bundle, X_df, df, has_label, out_path, metric_out) -> int:
+    """[v15 算法解耦] RF 基线独立推理路径.
+
+    仅执行 RF 预测 + 推理结果 CSV + 指标行, 不触碰主模型专属环节
+    (Stage-1 / MoE / d87 守卫 / L4 / L5 / 基线对比), 与 main 算法产物完全隔离.
+    """
+    rf = bundle.get("rf")
+    if rf is None:
+        log.error("[v15] rf 算法推理失败: bundle 不含 'rf' 模型对象 "
+                  "(请用 NILM_ALGO_SELECT=rf 训练或使用旧版合并 bundle)")
+        return 1
+    scaler = bundle["scaler"]
+    on_thr_eval = float(bundle.get("ON_THR", ON_THR_W))
+    # [v13.7] NaN 硬检测 (与主模型推理同口径)
+    assert_no_nan_features(X_df, stage_name="inference_rf", logger=log,
+                           raise_on_nan=True)
+    X = X_df.values.astype(np.float32)
+    X_s = scaler.transform(X)
+    with Timer("RF 基线推理", log):
+        y_pred = np.clip(rf.predict(X_s), 0, None)
+    state_pred = (y_pred >= on_thr_eval).astype(int)
+    y_true = df["y_ac"].values.astype(np.float32) if has_label \
+        else np.zeros_like(y_pred)
+    s_true = (y_true >= on_thr_eval).astype(int) if has_label else None
+    log.info(f"  [v15] RF 基线推理完成: 平均功率 {y_pred.mean():.2f} W, "
+             f"ON 步 {int(state_pred.sum())}/{len(state_pred)}")
+
+    save_predictions_csv(df.index, y_true, y_pred,
+                         state_true=s_true, state_pred=state_pred,
+                         out_path=out_path)
+    log.info(f"  ✓ 推理结果 -> {out_path}  ({len(y_pred)} 行)")
+
+    if has_label:
+        cls_rf = compute_classification_metrics(s_true, state_pred, y_pred)
+        reg_rf = compute_regression_metrics(y_true, y_pred)
+        log.info(f"  [v15] RF 基线评估: F1={cls_rf['F1']:.4f}, "
+                 f"MAE={reg_rf['MAE_W']:.2f}W, SAE={reg_rf['SAE']*100:.2f}%")
+        rows = flatten_metrics_to_rows(
+            "inference", "rf", cls_metrics=cls_rf, reg_metrics=reg_rf,
+            extra={"note": "v15 独立 RF 基线推理"},
+            source="inference",
+        )
+        merged_inf = save_metrics_csv(rows, metric_out, append=True)
+        log.info(f"  ✓ 评估指标长表 -> {metric_out}  "
+                 f"(本次追加 {len(rows)} 行, 文件累计 {len(merged_inf)} 行)")
+        # [v13.14] 推理侧逐日指标 (RF 版)
+        try:
+            _rf_daily = build_daily_metrics_rows(
+                df.index, y_true, y_pred, s_true, state_pred,
+                split_name="inference", on_thr_w=on_thr_eval, p_on=None,
+                date_labels=None, model_name="rf",
+                extra={"project_version": bundle.get("version", ""),
+                       "model_file": "rf_bundle.pkl"},
+            )
+            save_daily_metrics_csv(_rf_daily,
+                                   METRIC_DIR / "inference_daily_metrics.csv",
+                                   logger=log)
+        except Exception as _e:
+            log.warning(f"  [v15] RF 逐日指标计算失败, 忽略: {_e}")
+    log.info("=" * 70)
+    log.info("Step 5 推理完成 (algo=rf)")
+    return 0
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="NILM 独立推理脚本 (含多基线对比)")
     p.add_argument("--bus",    type=str, default=str(INFER_BUS_CSV),
@@ -89,6 +153,10 @@ def parse_args():
                    help="主模型 .pkl 路径")
     p.add_argument("--baseline", nargs="*", default=[],
                    help="基线模型列表 (rf/fallback/naive_mean/naive_zero/<.pkl 路径>)")
+    p.add_argument("--no-baseline", action="store_true",
+                   help="[v15] 不运行任何基线对比 (多算法解耦: 各算法独立推理时用)")
+    p.add_argument("--algo", type=str, default="main", choices=["main", "rf"],
+                   help="[v15 算法解耦] 推理目标算法: main=主模型, rf=RF 基线独立推理")
     p.add_argument("--out",    type=str,
                    default=str(PRED_DIR / "inference_result.csv"),
                    help="推理结果 CSV 输出路径")
@@ -118,10 +186,17 @@ def main():
     model_path  = Path(args.model)
     out_path    = Path(args.out)
     metric_out  = Path(args.metric_out)
-    baselines   = list(args.baseline) if args.baseline else []
+    baselines   = [] if args.no_baseline else (list(args.baseline) if args.baseline else [])
+
+    # [v15 算法解耦] rf 算法: 优先加载自包含 rf_bundle.pkl; 缺失时回退主模型 bundle (旧布局)
+    if args.algo == "rf" and not model_path.exists():
+        _rf_bundle = MODEL_DIR / "rf_bundle.pkl"
+        if _rf_bundle.exists():
+            log.info(f"  [v15] rf 算法推理: 切换模型路径 -> {_rf_bundle}")
+            model_path = _rf_bundle
 
     log.info("=" * 70)
-    log.info("Step 5: 独立推理 (v5: 多基线对比)")
+    log.info(f"Step 5: 独立推理 (v5: 多基线对比, v15: algo={args.algo})")
     log.info(f"  总线 CSV  : {bus_path}")
     log.info(f"  分路 CSV  : {branch_path if branch_path else '<未提供>'}")
     log.info(f"  主模型    : {model_path}")
@@ -272,6 +347,10 @@ def main():
             )
         else:
             season_labels = assign_season(df.index, use_temperature=False)
+
+    # ---------- 4b. [v15 算法解耦] rf 算法独立推理 (提前分流) ----------
+    if args.algo == "rf":
+        return _run_rf_inference(bundle, X_df, df, has_label, out_path, metric_out)
 
     # ---------- 5. 主模型推理 ----------
     with Timer("主模型推理 (MoE + 后处理)", log):
