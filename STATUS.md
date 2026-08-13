@@ -1,49 +1,44 @@
 # STATUS.md
 ## 当前目标
-- [v15] 代码重构：各功能模块解耦隔离；新增多算法模型支撑能力（main/RF/v14 三类算法代码模块解耦隔离，统一输入输出接口）；开放配置入口支持三种自定义运行模式（指定单模型 single / 多模型选择性 multi / 全部模型遍历 all）；产物输出按算法维度子目录隔离归档
+- [v16] 针对数据输入、数据输出与数据配置功能继续重构代码：三大模块完全解耦（两两零依赖），各自提供统一访问接口；编排层（批量调度 + 单用户流水线）与阶段脚本（02/03/04/05）的数据 I/O 与配置访问全部收敛到三大模块统一入口
 
 ## 已完成
-- [x] [v15] 新增 `scripts/algorithms/` 多算法统一插件框架：
-  - `base.py`：`AlgorithmModule` 抽象基类 + `AlgoContext` 上下文（统一输入输出接口：train/eval/infer 三阶段脚本、隔离环境变量、CLI 参数、模型完整性契约、产物子目录、bundle 文件名契约）
-  - `main_l4.py` / `rf_baseline.py` / `v14_enhanced.py`：三类算法模块，后续新算法仅需继承基类 + 注册即可接入
-  - `registry.py`：注册表 + `resolve_algorithm_selection()` 三种运行模式统一解析（优先级：CLI > time_filters 配置 > 内置默认 main+rf）
-- [x] [v15] 训练解耦门控：`03_train.py` 支持 `NILM_ALGO_SELECT`（main / rf / main+rf），主模型与 RF 基线完全独立训练；rf 产出自包含 `rf_bundle.pkl`（统一接口上下文齐备）；默认 main+rf 行为与重构前完全一致（向后兼容）
-- [x] [v15] 评估/推理解耦：`04_evaluate.py` / `05_inference.py` 支持 `--algo main|rf` 独立路径 + `--no-baseline` 隔离基线对比；main-only bundle 中 `rf` 键为 None 的防御处理
-- [x] [v15] v14 特征一致性契约：v14 物理指纹特征环境变量在训练/评估/推理三阶段一致注入（修复 137 vs 170 特征维度不匹配）
-- [x] [v15] 流水线编排重构：`run_user_pipeline.py` 按算法序列逐个执行（训练/复用→评估→推理→按算法归档），算法间故障隔离（单算法软跳过/硬失败不阻塞其他算法；05 失败时部分归档训练侧产物），退出码 0=≥1 算法成功 / 10=全部软跳过 / 1=无算法成功
-- [x] [v15] 产物输出结构：算法维度子目录隔离归档
-  - `models/<user_id>/<algo>/`：各算法模型资产互不覆盖
-  - `artifacts/trains/<user_id>/<algo>/`：训练评估 metrics + 预测 + plots
-  - `artifacts/infers/<user_id>/<algo>/`：推理 metrics + 预测 + plots
-  - 用户级数据视图（train/infer_on_periods*.csv）保持原位置；旧扁平布局聚合兼容（algo=flat）
-- [x] [v15] 批量层改造：`run_batch_users.py` 新增 `--algorithms` / `--algo-mode` CLI 透传；扫描阶段即解析每用户算法计划（dry-run 可见）；`summary_metrics_all_users.csv` 新增 `algo` 列（每用户×每算法 4 行）；`skipped_users.csv` 按算法维度收集；`batch_execution_state.csv` 新增 `algorithms` 列
-- [x] [v15] 配置入口：`time_filter_utils.py` 新增 `get_user_algorithms_config` / `get_user_algorithms_selection`（用户级 + `_default` 回退，与既有字段同语义）；`data/time_filters.example.json` 增加 `algorithms` 字段示例与说明
-- [x] 验证：单元测试 24 项（注册框架 13 + 配置解析 11）+ 合成数据冒烟 14 用例（03 训练门控 3、04/05 双链路 2、流水线编排 4、批量层 5）全部通过；既有 4 个单测脚本无回归；真实数据 5 用户 dry-run 扫描正常
+- [x] [v15] 多算法解耦重构（详见历史 STATUS 决策记录）：`scripts/algorithms/` 统一插件框架、03_train 训练门控、04/05 `--algo` 独立路径、流水线按算法编排、批量层算法维度汇总、time_filters `algorithms` 字段三种运行模式
+- [x] [v16] 新增三大解耦数据模块（两两零 import 依赖，`scripts/data_config.py` / `data_input.py` / `data_output.py`）：
+  - **数据配置模块 data_config**：`ConfigResolver`（配置 + CLI 覆盖 → `UserConfig` 每用户生效配置对象）、`UserConfig`（统一序列化接口 `to_pipeline_cli()`/`plan_line()`/各 `*_cli()`）、配置→运行环境翻译接口（`common_overrides_to_env`/`guard_cli_to_env`/`v14_flags_to_env`/`splits_spec_cli_to_env`）、time_filter_utils 底层实现门面再导出
+  - **数据输入模块 data_input**：命名契约 `RE_BUS/RE_BR`、`parse_data_dir`/`parse_user_folder`/`discover_users`（含配置 target_col 优先与 Ch{N} 反推链）、`is_runnable`/`get_execution_plan`、原始加载门面（load_bus_csv/load_branch_csv/resample_and_align）、运行时落地 `stage_train_data`/`stage_infer_data`/`cleanup_staged_data_files`、时段过滤统一入口 `parse_time_filter_spec`/`apply_time_filter_spec`
+  - **数据输出模块 data_output**：统一 CSV 写出 `write_csv`、预测/指标写出门面（metrics_utils 再导出）、模型资产持久化（`resolve_model_path`/`load_model_bundle`/`save_model_bundle` 含备份滚动清理/`save_model_components`）、归档清理（`archive_algo_outputs`/`cleanup_artifacts_top`/`restore_algo_models_to_top`/`check_algo_model_complete`）、批量状态（执行状态 CSV 四函数）与汇总（`aggregate_metrics`/`collect_skip_reasons`）
+- [x] [v16] 编排层收敛：`run_batch_users.py` 删去内联的发现/解析/状态/汇总/配置解析代码，全部走三大模块（每用户配置经 `resolver.resolve()` → `UserConfig`）；`run_user_pipeline.py` 删去内联的数据落地/归档/清理/配置翻译代码，数据落地走 data_input、归档走 data_output、配置→环境翻译走 data_config
+- [x] [v16] 阶段脚本收敛：02（加载/时段过滤）、03（指标写出 + 模型 bundle/组件持久化 + 原始数据加载）、04/05（指标写出 + rf 模型路径解析 + 05 时段过滤）全部改走统一接口
+- [x] [v16] 验证：新增单测 27 项（data_config 10 + data_input 8 + data_output 9）全部通过；既有单测（执行状态/复合目标列/日级原始点数/min_w 列/算法注册/配置解析）回归通过；全链路冒烟回归通过（03 训练门控 3 用例、04/05 双链路 2 用例、流水线编排 4 用例、批量层 5 用例）
+- [x] 三模块解耦关系核验：两两零 import 依赖；依赖方向仅指向底层实现层（feature_utils/metrics_utils/time_filter_utils/common）
 
 ## 进行中
 - 收尾仪式：更新 STATUS / 会话纪要 / 专题报告，提交并推送远程
 
 ## 下一步（TODO）
-1. 听取用户对多算法重构、配置字段与产物目录结构的反馈，按需微调
-2. 可选：在 Word 技术方案文档中同步“多算法运行模式与算法维度产物体系”章节
-3. 后续按统一接口扩展新算法（继承 `AlgorithmModule` + 注册即可）
+1. 听取用户对三大模块接口粒度与命名（data_input/data_output/data_config）的反馈，按需调整
+2. 可选：在 Word 技术方案文档中同步“数据输入/数据输出/数据配置三大解耦模块”章节
+3. 后续新功能按模块归属接入：数据读取→data_input、产物写出→data_output、配置字段→data_config + time_filter_utils 实现层
 
 ## 决策记录 / 踩坑
-- [2026-08-13][v15] 多算法“解耦隔离”的实现口径：算法隔离落在四个层面——(1) 代码模块隔离（`scripts/algorithms/` 每算法一个模块文件）；(2) 训练门控隔离（`NILM_ALGO_SELECT` 让 03_train 只训指定算法，rf 产出独立自包含 bundle）；(3) 运行环境隔离（每算法子进程独立 env，v14 的 monkey-patch 不再泄漏到其他算法）；(4) 产物隔离（models/artifacts 按 `<algo>` 子目录归档）。这样即使 main 与 v14 共用主模型槽位，两者产物也互不覆盖。
-- [2026-08-13][v15] 三种运行模式语义：`single`=selected 取第一个；`multi`=selected 列表原样执行；`all`=注册表全部算法按注册顺序遍历（忽略 selected）。优先级 CLI > time_filters `algorithms` 字段 > 内置默认（main+rf，与重构前行为一致）。无显式配置且用户 v14 增强开关开启时，默认列表自动追加 v14（兼容旧 `--v14-flags` 语义）。
-- [2026-08-13][v15] 多算法顺序执行时的共享状态治理：`aligned_15min.csv` / `merged_*.csv` / `infer_*.csv` / `skip_reason.json` 从“单算法用完即清”改为“执行期保留（`_CLEANUP_WHITELIST`）+ 流水线收尾统一清理”，否则后序算法训练/推理会因共享文件被前序算法归档清理而崩溃（冒烟测试实测踩坑）。
-- [2026-08-13][v15] v14 特征一致性契约：`build_features` 依赖 `NILM_V14_*` 环境变量决定是否注入物理指纹特征，若只在训练阶段注入会导致评估阶段特征维度不匹配（训练 170 维 vs 评估 137 维），故 v14 模块在 train/eval/infer 三阶段注入相同环境。
-- [2026-08-13][v15] 算法间故障隔离与退出码契约：单算法失败不阻塞其他算法；流水线退出码 0=≥1 算法成功、10=全部算法软跳过（数据质量门）、1=无算法成功。批量层状态表记录本次 `algorithms` 计划，汇总表以 `algo` 列区分各算法指标（inference 阶段模型优选：main/v14→main_final，rf→rf）。
+- [2026-08-13][v16] 三大模块解耦口径：**两两零 import**。data_config 是配置底座（仅依赖 time_filter_utils/algorithms 实现层）；data_input 接受配置 dict 参数 + 惰性 import time_filter_utils（不 import data_config，避免模块级耦合）；data_output 接受算法模块与上下文参数 + 惰性 import algorithms.registry（只依赖 metrics_utils/common 实现层）。依赖方向严格单向：编排层 → 三大模块 → 底层实现层。
+- [2026-08-13][v16] 统一接口设计：每个模块对外提供"门面函数 + 再导出"两层——门面函数承载业务语义（如 `stage_train_data`/`archive_algo_outputs`/`ConfigResolver.resolve`），再导出保证历史调用与底层实现（feature_utils/metrics_utils/time_filter_utils）零行为变化；阶段脚本切换 import 来源即可，语义完全等价。
+- [2026-08-13][v16] 配置模块的序列化接口：`UserConfig.to_pipeline_cli()` 把已解析生效值统一序列化为流水线子进程 CLI 参数（时段过滤/守卫/splits/common 覆盖/v14/算法列表与模式），批量层不再手工拼接参数字典；`plan_line()` 保持扫描/执行阶段"算法计划"日志格式不变（冒烟断言兼容）。
+- [2026-08-13][v16] 模型持久化接口：`save_model_bundle`（主文件 + 时间戳备份 + 滚动清理）与 `save_model_components`（组件 pkl + meta JSON）从 03_train 内联代码提炼，主模型/RF/v14 三类算法共用同一套落盘契约；备份豁免集合（主文件/v42 对照文件）与历史滚动清理行为完全一致。
+- [2026-08-13][v16] 执行状态测试迁移：`test_batch_execution_state.py` 的导入源从 run_batch_users 改为 data_output（实现随模块迁移，测试断言不变），保证"批量执行状态"作为数据输出模块的标准接口被持续验证。
+- [2026-08-13][v16] 语义保持原则：重构全程"只搬家、不改语义"——目标列反推链、时段过滤闭区间语义、白名单保护契约、汇总模型优选顺序（main/v14→main_final、rf→rf）、旧扁平布局兼容（algo=flat）等历史行为逐一保留，14 个冒烟用例 + 既有单测作为回归护栏。
 
 ## 关键文件路径
-- `scripts/algorithms/` — 多算法统一插件框架（base/registry + main_l4/rf_baseline/v14_enhanced 三个算法模块）
-- `scripts/test_algorithm_registry.py` / `scripts/test_algo_config.py` — 框架与配置单测（24 项）
-- `scripts/03_train.py` — 训练解耦门控 `NILM_ALGO_SELECT`（main/rf/main+rf）
-- `scripts/04_evaluate.py` / `scripts/05_inference.py` — `--algo main|rf` 独立评估/推理路径
-- `scripts/run_user_pipeline.py` — 多算法编排（按算法序列执行 + 故障隔离 + 按算法归档）
-- `scripts/run_batch_users.py` — 批量调度（`--algorithms`/`--algo-mode` 透传 + 算法维度汇总）
-- `scripts/time_filter_utils.py` — 配置引擎（新增 algorithms 字段解析）
-- `data/time_filters.example.json` — 配置示例（含 algorithms 三种模式示例）
-- `/home/user/nilm_test/项目技术方案说明书_数据架构与核心算法全景规范.docx` — 技术方案 Word 文档（待后续同步多算法章节）
-- `REPORT_TEST.md` — 专题：v15 多算法解耦重构专题报告
+- `scripts/data_config.py` — 数据配置模块（统一配置访问接口：ConfigResolver / UserConfig / 环境翻译）
+- `scripts/data_input.py` — 数据输入模块（统一输入访问接口：发现/解析/加载/落地/时段过滤）
+- `scripts/data_output.py` — 数据输出模块（统一输出访问接口：CSV/模型资产/归档/状态/汇总）
+- `scripts/test_data_config.py` / `test_data_input.py` / `test_data_output.py` — 三模块单测（27 项）
+- `scripts/algorithms/` — [v15] 多算法统一插件框架（算法维度与数据维度正交解耦）
+- `scripts/run_batch_users.py` / `run_user_pipeline.py` — 编排层（已收敛到三大模块统一接口）
+- `scripts/02_align_and_feat.py` / `03_train.py` / `04_evaluate.py` / `05_inference.py` — 阶段脚本（数据 I/O 已收敛）
+- `scripts/time_filter_utils.py` — 数据配置底层实现层（字段语义与降级链）
+- `scripts/feature_utils.py` / `metrics_utils.py` — 数据输入/输出底层实现层
+- `/home/user/nilm_test/项目技术方案说明书_数据架构与核心算法全景规范.docx` — 技术方案 Word 文档（待后续同步三模块章节）
+- `REPORT_TEST.md` — 专题：v16 数据输入/输出/配置三大模块解耦重构报告
 - `session/NILM_AC_session_complete.md` — 全会话历史纪要

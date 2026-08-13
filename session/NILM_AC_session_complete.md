@@ -6224,3 +6224,21 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
   - 新增：`scripts/algorithms/`（5 文件）、`scripts/test_algorithm_registry.py`、`scripts/test_algo_config.py`
   - 修改：`scripts/03_train.py`、`04_evaluate.py`、`05_inference.py`、`run_user_pipeline.py`、`run_batch_users.py`、`time_filter_utils.py`、`data/time_filters.example.json`
   - 文档：`STATUS.md`、`REPORT_TEST.md`（v15 专题）、本纪要
+
+---
+
+## [2026-08-13] 会话纪要（v16 数据输入/数据输出/数据配置三大模块解耦重构）
+- 目标：针对数据输入、数据输出与数据配置功能继续重构代码，保证三个模块完全解耦（两两零依赖）并各自提供统一访问接口；编排层与阶段脚本的数据 I/O 与配置访问全部收敛到统一入口。
+- 完成项：
+  1. 新增三大解耦数据模块：`scripts/data_config.py`（ConfigResolver/UserConfig/环境翻译）、`scripts/data_input.py`（发现/解析/加载/落地/时段过滤）、`scripts/data_output.py`（CSV/模型资产/归档/状态/汇总），两两零 import 依赖（程序化断言核验）。
+  2. 编排层收敛：`run_batch_users.py` 删除内联的发现/解析/状态/汇总/配置解析代码，每用户配置经 `ConfigResolver.resolve()` → `UserConfig` 统一出口；`run_user_pipeline.py` 删除内联的数据落地/归档/清理/配置翻译代码，分别走 data_input/data_output/data_config。
+  3. 阶段脚本收敛：02（加载/时段过滤）、03（指标写出 + save_model_bundle/save_model_components 模型持久化 + 原始加载）、04/05（指标写出 + rf 模型路径解析 + 05 时段过滤）全部改走统一接口。
+  4. 测试迁移与新增：`test_batch_execution_state.py` 导入改指 data_output（断言不变）；新增 test_data_config（10 项）/test_data_input（8 项）/test_data_output（9 项）共 27 项单测。
+  5. 验证：新增 27 项单测 + 既有单测回归 + 全链路冒烟回归（03 门控 3、04/05 双链路 2、流水线 4、批量 5 用例）全部通过；残留引用扫描为零。
+- 关键决策：见 STATUS.md「决策记录」（两两零 import 解耦口径、门面函数+再导出双层接口、UserConfig 序列化契约、模型持久化接口提炼、只搬家不改语义原则）。
+- 未决问题：无。Word 技术方案文档的三大模块章节同步留待用户确认后追加。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 新增：`scripts/data_config.py`、`scripts/data_input.py`、`scripts/data_output.py`、`scripts/test_data_config.py`、`scripts/test_data_input.py`、`scripts/test_data_output.py`
+  - 修改：`scripts/run_batch_users.py`、`run_user_pipeline.py`、`02_align_and_feat.py`、`03_train.py`、`04_evaluate.py`、`05_inference.py`、`test_batch_execution_state.py`
+  - 文档：`STATUS.md`、`REPORT_TEST.md`（v16 专题）、本纪要

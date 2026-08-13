@@ -437,3 +437,67 @@ artifacts/
 - 合成数据冒烟：03 训练门控 3 用例（rf-only 隔离 / main-only 隔离 / 默认向后兼容）、04/05 双链路 2 用例（main/rf 独立评估与推理，产物互不交叉）、流水线编排 4 用例（single/multi/all/模型复用，含 v14 三阶段特征一致性）、批量层 5 用例（dry-run 计划、CLI multi 全流程、配置驱动 single、CLI 覆盖 all、旧扁平聚合兼容）全部通过。
 - 回归：既有 `test_batch_execution_state.py` / `test_composite_target_col.py` / `test_daily_raw_counts.py` / `test_min_w_column.py` 全部通过；真实数据目录 5 用户 dry-run 扫描正常。
 - **遗留问题**：暂无。后续新算法接入请按 `scripts/algorithms/` 基类契约实现并在注册表登记。
+
+---
+
+# [2026-08-13] 专题：v16 数据输入/数据输出/数据配置三大模块解耦重构报告
+
+> **专题类型**：工程重构 / 模块解耦 / 统一访问接口
+> **目标**：针对数据输入、数据输出与数据配置功能继续重构代码，保证三个模块完全解耦（两两零依赖），并各自提供统一的访问接口；编排层与阶段脚本的全部数据 I/O 与配置访问收敛到统一入口。
+
+## 1. 三大模块与统一接口
+
+```
++--------------------------------------------------------------------------------+
+|  编排层  run_batch_users.py (批量调度) | run_user_pipeline.py (单用户流水线)    |
++--------------------------------------------------------------------------------+
+        |                        |                        |
+        v                        v                        v
++---------------+        +-----------------+        +-----------------+
+| 数据输入模块   |        | 数据输出模块     |        | 数据配置模块     |
+| data_input.py |        | data_output.py  |        | data_config.py  |
++---------------+        +-----------------+        +-----------------+
+| 发现/解析/加载/落地/过滤 | | CSV/模型资产/归档/汇总/状态 | | 集中式解析/序列化/环境翻译 |
++---------------+        +-----------------+        +-----------------+
+        |                        |                        |
+        v                        v                        v
++---------------+        +-----------------+        +-----------------+
+| feature_utils |        | metrics_utils   |        | time_filter_utils|
+| (加载/对齐/特征) |       | (指标/预测 CSV)  |        | (配置字段语义)    |
++---------------+        +-----------------+        +-----------------+
+```
+
+**解耦口径**：三模块**两两零 import 依赖**（已用程序化断言核验）；依赖方向严格单向——编排层 → 三大模块 → 底层实现层。算法维度（`scripts/algorithms/`）与数据维度（三大模块）正交解耦。
+
+| 模块 | 统一接口要点 |
+|---|---|
+| **数据输入 data_input** | 命名契约 `RE_BUS`/`RE_BR`；`parse_data_dir`→`parse_user_folder`→`discover_users` 发现解析链（配置 target_col 优先 → Ch{N} 反推 → 分路 pN 退化 → 默认 p1）；`is_runnable`/`get_execution_plan` 计划描述；`load_bus_csv`/`load_branch_csv`/`resample_and_align` 原始加载门面；`stage_train_data`/`stage_infer_data`/`cleanup_staged_data_files` 运行时落地与收尾清理；`parse_time_filter_spec`/`apply_time_filter_spec` 时段过滤一步到位入口 |
+| **数据输出 data_output** | `write_csv` 通用写出；预测/指标写出门面（`save_predictions_csv`/`save_metrics_csv`/`save_daily_metrics_csv`/`build_comparison_table`/`build_daily_metrics_rows`/`build_leak_ood_metric_rows`/`compute_raw_daily_counts` 等）；模型资产持久化（`resolve_model_path` 算法感知路径解析 / `load_model_bundle` / `save_model_bundle` 含时间戳备份+滚动清理 / `save_model_components` 组件 pkl+meta JSON）；归档清理（`archive_algo_outputs` 算法维度归档 / `cleanup_artifacts_top` 白名单保护 / `restore_algo_models_to_top` / `check_algo_model_complete`）；批量层（执行状态 CSV 四函数、`collect_skip_reasons`、`aggregate_metrics`） |
+| **数据配置 data_config** | `ConfigResolver`（配置 + CLI 覆盖 → 每用户生效配置，支持 dict/path 双入口与 `from_batch_args` 便捷构造）；`UserConfig`（已解析生效值对象：target_col / guard_enabled / train·infer 时段 / splits / common_overrides / v14_flags / algorithms / algo_mode / warnings）；序列化接口 `to_pipeline_cli()`/`plan_line()`；配置→环境翻译（`common_overrides_to_env`/`clear_common_override_env`/`guard_cli_to_env`/`v14_flags_to_env`/`splits_spec_cli_to_env`/`v14_enabled_from_spec`）；time_filter_utils 全部门面再导出 |
+
+## 2. 收敛范围（重构前 → 重构后）
+
+| 原位置 | 收敛去向 |
+|---|---|
+| run_batch_users：RE_BUS/RE_BR、parse_user_folder、discover_users、is_runnable、get_execution_plan | → data_input |
+| run_batch_users：执行状态 CSV 四函数、collect_skip_reasons、aggregate_metrics | → data_output |
+| run_batch_users：resolve_user_run_config 内联配置解析 | → data_config.ConfigResolver.resolve() → UserConfig |
+| run_user_pipeline：setup_user_data / setup_infer_data | → data_input.stage_train_data / stage_infer_data |
+| run_user_pipeline：archive_algo_outputs / cleanup_artifacts_top / restore_algo_models_to_top / check_algo_model_complete | → data_output |
+| run_user_pipeline：守卫/splits/common 覆盖/v14 的 env 翻译内联代码 | → data_config 翻译接口 |
+| 02：原始加载 + 时段过滤 import | → data_input / data_config |
+| 03：指标写出 + bundle/组件/meta 落盘 + d87 原始加载 | → data_output（save_model_bundle/save_model_components）/ data_input |
+| 04/05：指标写出 + rf 模型路径解析（05 另含时段过滤） | → data_output / data_input / data_config |
+| test_batch_execution_state：导入源 | → data_output（断言不变） |
+
+## 3. 关键语义保持契约（重构护栏）
+
+重构坚持"**只搬家、不改语义**"：目标列反推链、时段过滤闭区间语义、`_CLEANUP_WHITELIST` 白名单保护、汇总模型优选顺序（train/val/test：main/v14→`main`、rf→`rf`；inference：main/v14→`main_final`→`main`、rf→`rf`）、旧扁平布局聚合兼容（`algo=flat`）、v14 三阶段特征环境一致性、备份滚动清理（保留 3 份 + 主文件/v42 对照文件豁免）等历史行为逐一保留。
+
+## 4. 验证记录
+
+- **新增单测 27 项**：`test_data_config.py`（10 项：解析器/CLI 优先级/_default 回退/序列化/环境翻译）、`test_data_input.py`（8 项：命名契约/解析链/反推退化/落地往返/时段过滤）、`test_data_output.py`（9 项：写出/模型资产/归档布局/白名单/状态/聚合算法维度+扁平兼容）全部通过。
+- **既有单测回归**：test_batch_execution_state（导入改指 data_output）、test_composite_target_col、test_daily_raw_counts、test_min_w_column、test_algorithm_registry、test_algo_config 全部通过。
+- **全链路冒烟回归**：03 训练门控 3 用例（rf-only/main-only/默认向后兼容）、04/05 双链路 2 用例、流水线编排 4 用例（single/multi/all/模型复用）、批量层 5 用例（dry-run/CLI multi/配置 single/CLI 覆盖 all/扁平兼容）全部通过。
+- **解耦关系核验**：程序化断言三模块两两零 import 依赖；残留引用扫描（`setup_user_data`/`resolve_user_run_config`/`_parse_one_dir` 等）为零。
+- **遗留问题**：暂无。后续新数据能力按归属接入：读取→data_input、写出→data_output、配置字段→data_config（语义实现沉淀在 time_filter_utils）。
