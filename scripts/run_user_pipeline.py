@@ -28,7 +28,7 @@ v6.12.6+v6.15.0 优雅降级 (保留):
     - 无推理总线: 跳过 05 推理, 仅完成训练/验证/测试
     - 无推理分路: 跑 05 仅产出预测 CSV, 无评估指标
 """
-import argparse, sys, subprocess, shutil, json, os
+import argparse, sys, shutil, json, os
 from pathlib import Path
 
 import pandas as pd
@@ -394,186 +394,131 @@ def _filter_inference_metrics(project_root, eval_dates_str,
     print(f"  [v6.14 评估过滤] 已保存 -> {filtered_csv}")
 
 
-def run_step(cmd, name, project_root, extra_env=None):
-    print(f"\n{'='*70}\n  STEP: {name}\n{'='*70}")
-    print(f"  CMD: {' '.join(cmd)}")
-    # v6.12.6+v6.15.0-graceful-v3 修复:
-    #   Windows 默认 locale = GBK, subprocess.run(text=True) 会用 GBK 解码子进程 stdout,
-    #   而子进程脚本本身打印中文 / 含 UTF-8 多字节字符 → 父端 _readerthread 抛
-    #   UnicodeDecodeError, result.stdout 变成 None, 下游 .strip() 二次 AttributeError 崩溃.
-    #   修复策略: 父端显式 encoding="utf-8" + errors="replace" (任何非 UTF-8 字节兜底为 ?,
-    #   不再崩); 同时给子进程注入 PYTHONIOENCODING=utf-8 强制其 stdout 用 UTF-8 输出.
-    sub_env = dict(os.environ)
-    sub_env.setdefault("PYTHONIOENCODING", "utf-8")
-    # [v15 算法解耦] 算法模块隔离环境: 只对本算法的子进程生效, 不污染其他算法
-    if extra_env:
-        sub_env.update(extra_env)
-    try:
-        result = subprocess.run(
-            cmd, cwd=str(project_root / "scripts"),
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            env=sub_env,
-        )
-    except FileNotFoundError as e:
-        # Windows 常见: 硬编码 "python3" 会找不到 (应使用 sys.executable)
-        print(f"  [FAIL] FileNotFoundError: {e}")
-        print(f"     当前 Python 解释器: {sys.executable}")
-        print(f"     建议: 用 sys.executable 替代硬编码 'python3' / 'python'")
-        raise RuntimeError(f"Step {name} 启动失败: {e}")
-    # None 防御: 即使将来 reader 线程仍因任何原因失败导致 stdout=None, 也不能再二次崩
-    stdout_text = result.stdout if result.stdout is not None else ""
-    stderr_text = result.stderr if result.stderr is not None else ""
-    # ---------- [v6.12.6+v6.15.0-graceful-v5] 软跳过退出码 ----------
-    # 03_train.py 的 3 个数据质量门: 11=对齐过少 / 12=单类 / 13=val/test 空
-    # 此类退出非"错误", 而是数据本身不可训练 -> 抛 _SoftSkip 让上层做差异化处理
-    if result.returncode in (11, 12, 13):
-        # 打印最后 30 行 (含 [SKIP] 提示)
-        tail = stdout_text.strip().split("\n")[-30:]
-        print("\n".join(tail))
-        raise _SoftSkip(code=result.returncode, step=name)
-    if result.returncode != 0:
-        print("STDOUT:", stdout_text[-2000:])
-        print("STDERR:", stderr_text[-2000:])
-        raise RuntimeError(f"Step {name} failed (code={result.returncode})")
-    # 仅打印最后 30 行
-    tail = stdout_text.strip().split("\n")[-30:]
-    print("\n".join(tail))
-    return stdout_text
-
-
-class _SoftSkip(Exception):
-    """数据质量门触发的软跳过 (非异常路径) - graceful-v5 引入"""
-    def __init__(self, code: int, step: str):
-        self.code = code
-        self.step = step
-        super().__init__(f"[SKIP code={code}] at step {step}")
-
-
 def run_algorithm_flow(algo_name, ctx, args, project_root, output_dir,
                        has_inference, infer_bus_dst, infer_br_dst,
-                       effective_on_thr_w) -> str:
-    """[v15 多算法重构] 执行单个算法的 训练/复用 -> 评估 -> 推理 -> 归档 流程.
+                       effective_on_thr_w, runner=None) -> str:
+    """[v15/v17] 执行单个算法的 训练/复用 -> 评估 -> 推理 -> 归档 流程.
+
+    [v17] 训练/评估/推理全部经由算法模块统一访问接口 (train/evaluate/infer),
+    流水线不再手工拼装子进程命令; 结构化 StageResult 驱动流程分支.
 
     返回状态字符串:
       "ok"                  : 该算法全流程成功
       "soft_skip:<code>"    : 数据质量门触发 (软跳过, 不阻塞其他算法)
       "fail:<原因>"         : 真异常 (记录后继续其他算法, 保证算法间隔离)
     """
-    from algorithms.registry import REGISTERED_ALGORITHMS
-    algo_mod = REGISTERED_ALGORITHMS[algo_name]
-    PY = sys.executable
+    from algorithms import get_algorithm, StageRunner
+    algo_mod = get_algorithm(algo_name)
+    if runner is None:
+        runner = StageRunner(cwd=project_root / "scripts")
+    # [v17] 推理数据落地路径填充到上下文 (统一推理接口自动组装 --bus/--branch)
+    ctx.infer_bus_staged = infer_bus_dst or ""
+    ctx.infer_branch_staged = infer_br_dst or ""
     print(f"\n{'#'*70}\n  算法执行: [{algo_name}] {algo_mod.display_name}\n{'#'*70}")
 
-    train_ok = False   # [v15] 训练+评估是否已成功 (05 失败时用于部分归档, 不丢弃训练产物)
-    try:
-        # ---- 3. 决定是否训练该算法 (按算法模型契约; --force-retrain 强制) ----
-        model_ok, missing_files, model_dir = check_algo_model_complete(algo_mod, ctx)
-        did_train = True
-        if (not ctx.force_retrain) and model_ok:
-            did_train = False
-            print(f"\n{'='*70}\n  [v15] 跳过训练: 复用已有模型 (算法={algo_name})\n{'='*70}")
-            print(f"  模型目录: {model_dir}")
-            print(f"  完整性检查: {len(algo_mod.required_model_files)} 个必备文件存在")
-            print(f"  (如需强制重训, 加 --force-retrain)")
-            restore_algo_models_to_top(algo_mod, ctx, model_dir)
-        else:
-            if ctx.force_retrain and model_ok:
-                print(f"\n  [v15] --force-retrain 已开启, 强制重训算法 {algo_name}")
-            elif not model_ok:
-                print(f"\n  [v15] 算法 {algo_name} 模型不完整, 需要训练")
-                print(f"  模型目录: {model_dir}")
-                print(f"  缺失文件: {missing_files}")
-            run_step([PY, algo_mod.train_script] + algo_mod.train_args(ctx),
-                     f"03 训练 [{algo_name}] ({algo_mod.display_name})",
-                     project_root, extra_env=algo_mod.train_env(ctx))
-            run_step([PY, algo_mod.eval_script] + algo_mod.eval_args(ctx),
-                     f"04 评估 [{algo_name}] ({algo_mod.display_name})",
-                     project_root, extra_env=algo_mod.eval_env(ctx))
-
-            # [v13.10/v15] 训练完成后, 从该算法 bundle 读切分日期补跑训练 analyze
-            if not args.skip_analyze:
-                _bundle_split = _load_bundle_split_dates(
-                    project_root, bundle_name=algo_mod.bundle_file_name(ctx))
-                if _bundle_split is not None:
-                    _all_train_dates = _list_dates_in_branch_csv(ctx.train_branch)
-                    _train_labels = _build_train_date_labels(_all_train_dates, _bundle_split)
-                    _train_analyze_out = output_dir / "trains" / ctx.user_id
-                    run_analyze_step(
-                        stage="train",
-                        br_csv=ctx.train_branch,
-                        target_col=ctx.target_col,
-                        on_thr_w=effective_on_thr_w,
-                        out_dir=_train_analyze_out,
-                        project_root=project_root,
-                        date_labels=_train_labels,
-                        phase="post",
-                        bus_csv=ctx.train_bus,
-                    )
-                else:
-                    print(f"\n  [v13.10] 跳过训练后补跑 analyze: "
-                          f"{algo_mod.bundle_file_name(ctx)} 未含 train_dates (旧模型?)")
-
-        train_ok = True   # [v15] 训练+评估阶段完成
-
-        # ---- 4. 该算法推理 (使用用户的推理数据) ----
-        if has_inference:
-            infer_cmd = [PY, algo_mod.infer_script, "--bus", infer_bus_dst]
-            infer_cmd += algo_mod.infer_args(ctx)
-            if infer_br_dst:
-                infer_cmd += ["--branch", infer_br_dst]
-            else:
-                infer_cmd += ["--no-branch"]
-            if ctx.infer_time_filter_spec.strip():
-                infer_cmd += ["--time-filter-spec", ctx.infer_time_filter_spec]
-            run_step(infer_cmd, f"05 推理 [{algo_name}] ({algo_mod.display_name})",
-                     project_root, extra_env=algo_mod.infer_env(ctx))
-            # v6.14 推理后处理: 若指定 --infer-eval-dates, 只算这些日期的指标
-            if args.infer_eval_dates.strip():
-                _filter_inference_metrics(
-                    project_root, args.infer_eval_dates,
-                    bundle_name=algo_mod.bundle_file_name(ctx))
-
-        # ---- 5. 该算法归档 (按算法维度隔离) ----
-        archive_algo_outputs(project_root, output_dir, ctx.user_id,
-                             algo_mod, ctx, has_inference, did_train=did_train)
-        return "ok"
-
-    except _SoftSkip as ss:
-        # [v15] 数据质量门触发: 仅该算法软跳过, 不阻塞其他算法
-        print(f"\n{'='*70}\n  [SKIP] 算法 {algo_name} 数据质量门触发 ({ss})\n{'='*70}")
-        try:
-            skip_src = project_root / "artifacts" / "skip_reason.json"
-            if skip_src.exists():
-                algo_dst = output_dir / "trains" / ctx.user_id / algo_mod.artifact_subdir()
-                algo_dst.mkdir(parents=True, exist_ok=True)
-                shutil.copy(skip_src, algo_dst / "skip_reason.json")
-                print(f"  [SKIP] 跳过原因已归档 -> {algo_dst / 'skip_reason.json'}")
+    def _archive_skip_reason():
+        skip_src = project_root / "artifacts" / "skip_reason.json"
+        if skip_src.exists():
+            algo_dst = output_dir / "trains" / ctx.user_id / algo_mod.artifact_subdir()
+            algo_dst.mkdir(parents=True, exist_ok=True)
+            shutil.copy(skip_src, algo_dst / "skip_reason.json")
+            print(f"  [SKIP] 跳过原因已归档 -> {algo_dst / 'skip_reason.json'}")
             # 兼容: 同时写用户级扁平 skip_reason.json (旧批量层读这里)
             flat_dst = output_dir / "trains" / ctx.user_id
             flat_dst.mkdir(parents=True, exist_ok=True)
-            if skip_src.exists():
-                shutil.copy(skip_src, flat_dst / "skip_reason.json")
-        except Exception as _e:
-            print(f"  [SKIP WARN] 跳过原因归档失败: {_e}")
-        cleanup_artifacts_top(project_root)
-        return f"soft_skip:{ss.code}"
+            shutil.copy(skip_src, flat_dst / "skip_reason.json")
 
-    except Exception as e:
-        import traceback
-        print(f"\n{'='*70}\n  [FAIL] 算法 {algo_name} 执行失败: {type(e).__name__}: {e}\n{'='*70}")
-        traceback.print_exc()
-        # [v15] 训练已成功而推理失败时, 部分归档训练侧产物 (不丢弃已训好的模型/指标)
-        if train_ok:
+    train_ok = False   # [v15] 训练+评估是否已成功 (05 失败时用于部分归档, 不丢弃训练产物)
+
+    # ---- 3. 决定是否训练该算法 (按算法模型契约; --force-retrain 强制) ----
+    model_ok, missing_files, model_dir = check_algo_model_complete(algo_mod, ctx)
+    did_train = True
+    if (not ctx.force_retrain) and model_ok:
+        did_train = False
+        print(f"\n{'='*70}\n  [v15] 跳过训练: 复用已有模型 (算法={algo_name})\n{'='*70}")
+        print(f"  模型目录: {model_dir}")
+        print(f"  完整性检查: {len(algo_mod.required_model_files)} 个必备文件存在")
+        print(f"  (如需强制重训, 加 --force-retrain)")
+        restore_algo_models_to_top(algo_mod, ctx, model_dir)
+    else:
+        if ctx.force_retrain and model_ok:
+            print(f"\n  [v15] --force-retrain 已开启, 强制重训算法 {algo_name}")
+        elif not model_ok:
+            print(f"\n  [v15] 算法 {algo_name} 模型不完整, 需要训练")
+            print(f"  模型目录: {model_dir}")
+            print(f"  缺失文件: {missing_files}")
+
+        # ---- [v17] 统一训练接口 ----
+        _train_res = algo_mod.train(ctx, runner=runner)
+        if _train_res.is_soft_skip:
+            # [v15] 数据质量门触发: 仅该算法软跳过, 不阻塞其他算法
+            print(f"\n{'='*70}\n  [SKIP] 算法 {algo_name} 数据质量门触发 "
+                  f"(code={_train_res.exit_code})\n{'='*70}")
             try:
-                archive_algo_outputs(project_root, output_dir, ctx.user_id,
-                                     algo_mod, ctx, has_inference=False,
-                                     did_train=True)
-            except Exception as _ae:
-                print(f"  [FAIL WARN] 部分归档失败: {_ae}")
-        # 硬失败不中断其他算法: 清理顶层临时产物, 保证下一个算法环境干净
-        cleanup_artifacts_top(project_root)
-        return f"fail:{type(e).__name__}:{e}"
+                _archive_skip_reason()
+            except Exception as _e:
+                print(f"  [SKIP WARN] 跳过原因归档失败: {_e}")
+            cleanup_artifacts_top(project_root)
+            return f"soft_skip:{_train_res.exit_code}"
+        if _train_res.is_fail:
+            cleanup_artifacts_top(project_root)
+            return f"fail:{_train_res.message}"
+
+        # ---- [v17] 统一评估接口 ----
+        _eval_res = algo_mod.evaluate(ctx, runner=runner)
+        if _eval_res.is_fail:
+            cleanup_artifacts_top(project_root)
+            return f"fail:{_eval_res.message}"
+
+        # [v13.10/v15] 训练完成后, 从该算法 bundle 读切分日期补跑训练 analyze
+        if not args.skip_analyze:
+            _bundle_split = _load_bundle_split_dates(
+                project_root, bundle_name=algo_mod.bundle_file_name(ctx))
+            if _bundle_split is not None:
+                _all_train_dates = _list_dates_in_branch_csv(ctx.train_branch)
+                _train_labels = _build_train_date_labels(_all_train_dates, _bundle_split)
+                _train_analyze_out = output_dir / "trains" / ctx.user_id
+                run_analyze_step(
+                    stage="train",
+                    br_csv=ctx.train_branch,
+                    target_col=ctx.target_col,
+                    on_thr_w=effective_on_thr_w,
+                    out_dir=_train_analyze_out,
+                    project_root=project_root,
+                    date_labels=_train_labels,
+                    phase="post",
+                    bus_csv=ctx.train_bus,
+                )
+            else:
+                print(f"\n  [v13.10] 跳过训练后补跑 analyze: "
+                      f"{algo_mod.bundle_file_name(ctx)} 未含 train_dates (旧模型?)")
+
+    train_ok = True   # [v15] 训练+评估阶段完成
+
+    # ---- 4. [v17] 统一推理接口 (自动组装 --bus/--branch/时段过滤) ----
+    if has_inference:
+        _infer_res = algo_mod.infer(ctx, runner=runner)
+        if _infer_res.is_fail:
+            # [v15] 训练已成功而推理失败时, 部分归档训练侧产物 (不丢弃已训好的模型/指标)
+            if train_ok:
+                try:
+                    archive_algo_outputs(project_root, output_dir, ctx.user_id,
+                                         algo_mod, ctx, has_inference=False,
+                                         did_train=True)
+                except Exception as _ae:
+                    print(f"  [FAIL WARN] 部分归档失败: {_ae}")
+            cleanup_artifacts_top(project_root)
+            return f"fail:{_infer_res.message}"
+        # v6.14 推理后处理: 若指定 --infer-eval-dates, 只算这些日期的指标
+        if args.infer_eval_dates.strip():
+            _filter_inference_metrics(
+                project_root, args.infer_eval_dates,
+                bundle_name=algo_mod.bundle_file_name(ctx))
+
+    # ---- 5. 该算法归档 (按算法维度隔离) ----
+    archive_algo_outputs(project_root, output_dir, ctx.user_id,
+                         algo_mod, ctx, has_inference, did_train=did_train)
+    return "ok"
 
 
 def main():
@@ -739,6 +684,9 @@ def main():
               f"仅当 v14 算法被选中时经模块隔离注入")
 
     # [v15] 多算法选择解析 (single/multi/all 三种运行模式统一入口)
+    # [v17] 统一阶段执行器 (各模型训练/评估/推理访问接口的执行底座)
+    from algorithms.runner import StageRunner
+    runner = StageRunner(cwd=project_root / "scripts")
     from algorithms.base import AlgoContext
     from algorithms.registry import (resolve_algorithm_selection,
                                      REGISTERED_ALGORITHMS,
@@ -832,19 +780,22 @@ def main():
             print(f"\n{'='*70}\n  STEP: TRAIN 前分路开机时段分析 -- 跳过 (--skip-analyze)\n{'='*70}")
 
         # 2.7 [v15] 02 对齐: 只要任一算法需要训练就跑 (对齐数据为训练前置依赖)
-        PY = sys.executable
         _any_train_needed = ctx.force_retrain or any(
             not REGISTERED_ALGORITHMS[n].check_model_complete(ctx)[0]
             for n in selected_algos
         )
         if _any_train_needed:
-            cmd02 = [PY, "02_align_and_feat.py"]
+            _cmd02_args = []
             if args.exclude_dates.strip():
-                cmd02 += ["--exclude-dates", args.exclude_dates]
+                _cmd02_args += ["--exclude-dates", args.exclude_dates]
             if args.train_time_filter_spec.strip():
-                cmd02 += ["--time-filter-spec", args.train_time_filter_spec]
+                _cmd02_args += ["--time-filter-spec", args.train_time_filter_spec]
                 print(f"  [v12] 训练时段过滤已启用 (spec 长度 {len(args.train_time_filter_spec)} 字节)")
-            run_step(cmd02, "02 对齐+特征", project_root)
+            # [v17] 共享数据准备步骤也经由统一阶段执行器
+            _res02 = runner.run("02_align_and_feat.py", args=_cmd02_args,
+                                label="02 对齐+特征")
+            if _res02.is_fail:
+                raise RuntimeError(f"Step 02 对齐+特征 失败: {_res02.message}")
         else:
             print(f"\n{'='*70}\n  [v15] 全部所选算法模型已完整, 跳过 02 对齐\n{'='*70}")
 
@@ -887,7 +838,7 @@ def main():
             algo_results[algo_name] = run_algorithm_flow(
                 algo_name, ctx, args, project_root, output_dir,
                 has_inference, infer_bus_dst, infer_br_dst,
-                _effective_on_thr_w,
+                _effective_on_thr_w, runner=runner,
             )
 
         # 4.5 [v15] 收尾清理: 全部算法跑完后, 清除共享对齐数据等顶层临时产物
