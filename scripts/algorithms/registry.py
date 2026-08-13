@@ -25,10 +25,13 @@ from __future__ import annotations
 
 from typing import Optional, List, Tuple
 
-from .base import AlgorithmModule
+from .base import AlgorithmModule, AlgoContext
 from .main_l4 import MainL4Module
 from .rf_baseline import RfBaselineModule
 from .v14_enhanced import V14Module
+
+# [v17] 统一阶段执行器与结构化结果 (各模型训练推理功能的执行底座)
+from .runner import StageRunner, StageResult, SOFT_SKIP_CODES
 
 # ---------- 注册表 (扩展新算法 = 在此追加一行) ----------
 REGISTERED_ALGORITHMS = {
@@ -162,3 +165,33 @@ def resolve_algorithm_selection(
         effective = mode or ("single" if len(selected) == 1 else "multi")
 
     return selected, effective, warnings
+
+
+# ============================================================
+# [v17] 注册表级统一多模型训练/评估/推理入口
+# ============================================================
+def train_models(algo_names, ctx: AlgoContext, runner=None):
+    """[v17] 统一多模型训练入口: 对指定算法序列逐个执行训练阶段.
+
+    Args:
+        algo_names: 算法名列表 (如 ["main", "rf", "v14"], 必须为已注册算法)
+        ctx:       AlgoContext 统一上下文
+        runner:    统一阶段执行器 (默认按 ctx.project_root 构建; 可注入假执行器测试)
+
+    Returns:
+        dict[str, StageResult]: {算法名: 结构化阶段结果}
+    """
+    return {name: get_algorithm(name).train(ctx, runner=runner)
+            for name in algo_names}
+
+
+def evaluate_models(algo_names, ctx: AlgoContext, runner=None):
+    """[v17] 统一多模型评估入口: 对指定算法序列逐个执行测试集评估阶段."""
+    return {name: get_algorithm(name).evaluate(ctx, runner=runner)
+            for name in algo_names}
+
+
+def infer_models(algo_names, ctx: AlgoContext, runner=None):
+    """[v17] 统一多模型推理入口: 对指定算法序列逐个执行独立生产推理阶段."""
+    return {name: get_algorithm(name).infer(ctx, runner=runner)
+            for name in algo_names}

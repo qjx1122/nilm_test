@@ -36,6 +36,8 @@ class AlgoContext:
     train_branch: str
     infer_bus: str = ""
     infer_branch: str = ""
+    infer_bus_staged: str = ""      # [v17] 推理数据落地后的总线路径 (统一推理接口用)
+    infer_branch_staged: str = ""   # [v17] 推理数据落地后的分路路径 (空 = 无标签推理)
     has_inference: bool = False
     force_retrain: bool = False
     exclude_dates: str = ""
@@ -66,6 +68,11 @@ class AlgorithmModule(ABC):
                                      (隔离保证: 只对本算法的子进程生效, 不污染其他算法)
       train_args/eval_args/infer_args : 各阶段额外 CLI 参数
       artifact_subdir()             : 产物隔离子目录名 (默认 = name)
+
+    统一访问接口 ([v17] 各模型训练推理功能统一入口, 直接调用, 无需手工拼装命令):
+      train(ctx, runner=None)    -> StageResult   # 统一训练接口
+      evaluate(ctx, runner=None) -> StageResult   # 统一评估接口
+      infer(ctx, runner=None)    -> StageResult   # 统一推理接口 (自动组装 bus/branch/时段过滤)
     """
 
     name: str = ""
@@ -80,6 +87,63 @@ class AlgorithmModule(ABC):
     def artifact_subdir(self) -> str:
         """产物归档子目录名: artifacts/{trains,infers}/<user_id>/<artifact_subdir()>/"""
         return self.name
+
+    # ============================================================
+    # [v17] 统一训练/评估/推理访问接口
+    # ============================================================
+    def _make_runner(self, ctx: AlgoContext):
+        """构建默认统一阶段执行器 (可注入自定义 runner 以便测试/扩展)."""
+        from .runner import StageRunner
+        return StageRunner(cwd=ctx.project_root / "scripts")
+
+    def train(self, ctx: AlgoContext, runner=None) -> "StageResult":
+        """[v17] 统一训练接口: 执行本算法训练阶段并返回结构化结果.
+
+        内部组装: 训练脚本 + 算法隔离环境 (train_env) + 算法 CLI 参数 (train_args),
+        经统一执行器运行; 返回 StageResult (ok / soft_skip(11/12/13) / fail).
+        调用方无需感知脚本名 / 环境变量 / 参数细节.
+        """
+        from .runner import StageResult
+        r = runner if runner is not None else self._make_runner(ctx)
+        return r.run(self.train_script, args=self.train_args(ctx),
+                     env=self.train_env(ctx),
+                     label=f"03 训练 [{self.name}] ({self.display_name})",
+                     algo=self.name, stage="train")
+
+    def evaluate(self, ctx: AlgoContext, runner=None) -> "StageResult":
+        """[v17] 统一评估接口: 执行本算法测试集评估阶段并返回结构化结果."""
+        r = runner if runner is not None else self._make_runner(ctx)
+        return r.run(self.eval_script, args=self.eval_args(ctx),
+                     env=self.eval_env(ctx),
+                     label=f"04 评估 [{self.name}] ({self.display_name})",
+                     algo=self.name, stage="evaluate")
+
+    def infer(self, ctx: AlgoContext, runner=None) -> "StageResult":
+        """[v17] 统一推理接口: 执行本算法独立生产推理阶段并返回结构化结果.
+
+        自动组装通用参数: --bus (落地推理总线) / --branch | --no-branch (落地分路)
+        / --time-filter-spec (推理时段过滤), 再叠加本算法 infer_args 与隔离环境.
+        前提: ctx.infer_bus_staged 已由流水线在数据落地后填充.
+        """
+        r = runner if runner is not None else self._make_runner(ctx)
+        if not ctx.infer_bus_staged:
+            from .runner import StageResult
+            return StageResult(algo=self.name, stage="inference",
+                               label=f"05 推理 [{self.name}]",
+                               status="fail",
+                               message="ctx.infer_bus_staged 为空 (推理数据未落地)")
+        args = list(self.infer_args(ctx))
+        args += ["--bus", ctx.infer_bus_staged]
+        if ctx.infer_branch_staged:
+            args += ["--branch", ctx.infer_branch_staged]
+        else:
+            args += ["--no-branch"]
+        if ctx.infer_time_filter_spec.strip():
+            args += ["--time-filter-spec", ctx.infer_time_filter_spec]
+        return r.run(self.infer_script, args=args,
+                     env=self.infer_env(ctx),
+                     label=f"05 推理 [{self.name}] ({self.display_name})",
+                     algo=self.name, stage="inference")
 
     # ---------- 阶段命令构建 (统一输入输出接口) ----------
     def train_env(self, ctx: AlgoContext) -> dict:
