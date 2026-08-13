@@ -26,9 +26,12 @@ artifacts/
                                      原子写 (.tmp + os.replace), 崩溃时最多丢当前正跑的.
                                      用 --resume 启用断点续跑 (默认跳过 ok/soft_skip;
                                      加 --resume-skip-failed 也跳过 fail).
-  skipped_users.csv                  [汇总] 软跳过用户原因 (若有)
-  trains/<user_id>/                  训练评估 metrics + 对比表 + plots
-  infers/<user_id>/                  推理评估 metrics + 预测结果 + plots
+  skipped_users.csv                  [汇总] 软跳过用户 × 算法原因 (若有)
+  trains/<user_id>/                  训练前/后开机时段分析 (数据视图, 算法无关)
+  trains/<user_id>/<algo>/           [v15] 该算法训练评估 metrics + 预测 + plots
+  infers/<user_id>/<algo>/           [v15] 该算法推理 metrics + 预测 + plots
+                                     (algo ∈ main / rf / v14, 按 --algorithms/--algo-mode
+                                      或 time_filters 配置 algorithms 字段选择)
 
 ------ 文件命名规范 (设备编号在前, 用户编号在后) ------
   文件夹: <device>_<user>            例: 800080252842_4206894986488
@@ -45,8 +48,14 @@ artifacts/
   python scripts/run_batch_users.py                 # 跑 data/trains/ 下全部用户
   python scripts/run_batch_users.py --users 800080252842_4206894986488 ...
   python scripts/run_batch_users.py --data-dir /path/to/data --skip-existing
+  # [v15] 多算法运行模式: 指定单模型 / 多模型选择性 / 全部模型遍历
+  python scripts/run_batch_users.py --algorithms rf --algo-mode single
+  python scripts/run_batch_users.py --algorithms main,v14 --algo-mode multi
+  python scripts/run_batch_users.py --algo-mode all
+  # (也可在 --time-filter-config JSON 中按用户配置 "algorithms": {"mode":..., "selected":[...]})
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -333,7 +342,7 @@ def get_execution_plan(info):
 _EXECUTION_STATE_CSV_NAME = "batch_execution_state.csv"
 _EXECUTION_STATE_COLS = ["user_id", "status", "success",
                          "started_at", "finished_at", "duration_s",
-                         "message", "target_col", "run_id"]
+                         "message", "target_col", "algorithms", "run_id"]
 
 
 def _execution_state_path(output_dir) -> "Path":
@@ -442,7 +451,8 @@ def run_single_user(info, output_dir, skip_existing=False, log_file=None,
                     guard_enabled="",
                     splits_time_filter_spec="",
                     common_overrides_spec="",
-                    v14_flags_spec=""):
+                    v14_flags_spec="",
+                    algorithms="", algo_mode=""):
     """对单个用户调用 run_user_pipeline.py
 
     [v6.12.6+v6.15.0-graceful-v7] 三态返回:
@@ -496,6 +506,11 @@ def run_single_user(info, output_dir, skip_existing=False, log_file=None,
     # [v14] 透传 v14 增强配置
     if v14_flags_spec:
         cmd += ["--v14-flags", v14_flags_spec]
+    # [v15] 透传多算法选择 (列表 + 运行模式)
+    if algorithms:
+        cmd += ["--algorithms", algorithms]
+    if algo_mode:
+        cmd += ["--algo-mode", algo_mode]
 
     # v6.12.6+v6.15.0-graceful-v3: 强制子进程 stdout/stderr 使用 UTF-8 输出,
     # 与本批处理脚本 + 子进程 reconfigure 形成"端到端 UTF-8 一致" (Windows GBK 兼容)
@@ -557,12 +572,14 @@ def run_single_user(info, output_dir, skip_existing=False, log_file=None,
 
 
 def collect_skip_reasons(output_dir: Path, summary_dir: Path):
-    """[v9 新路径] 收集所有用户的 skip_reason.json 汇总成 CSV
+    """[v9/v15] 收集所有用户 × 算法的 skip_reason.json 汇总成 CSV
 
-    扫描 artifacts/trains/<user_id>/skip_reason.json (软跳过都属训练阶段失败),
-    汇总成 artifacts/skipped_users.csv.
+    v15 新布局: 扫描 artifacts/trains/<user_id>/<algo>/skip_reason.json (软跳过
+    属训练阶段失败, 按算法隔离), 汇总成 artifacts/skipped_users.csv (新增 algo 列).
+    旧扁平布局 (trains/<user_id>/skip_reason.json) 仅在用户无任何 per-algo 记录时读取.
     """
     import json as _json
+    from algorithms.registry import ALGORITHM_NAMES
     _USER_DIR_RE = re.compile(r"^\d+_\d+$")
     train_root = output_dir / "trains"
     rows = []
@@ -571,21 +588,41 @@ def collect_skip_reasons(output_dir: Path, summary_dir: Path):
     for user_dir in sorted(train_root.iterdir()):
         if not user_dir.is_dir() or not _USER_DIR_RE.match(user_dir.name):
             continue
-        skip_f = user_dir / "skip_reason.json"
-        if not skip_f.exists():
+        # 1. 新布局: per-algo skip_reason.json
+        per_algo_rows = []
+        for algo_dir in sorted(user_dir.iterdir()):
+            if not algo_dir.is_dir() or algo_dir.name not in ALGORITHM_NAMES:
+                continue
+            skip_f = algo_dir / "skip_reason.json"
+            if not skip_f.exists():
+                continue
+            try:
+                info = _json.loads(skip_f.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"  [WARN] 读取 {skip_f} 失败: {e}")
+                continue
+            row = {"user_id": user_dir.name, "algo": algo_dir.name}
+            row.update(info)
+            per_algo_rows.append(row)
+        if per_algo_rows:
+            rows += per_algo_rows
+            continue
+        # 2. 旧扁平布局兼容 (仅当该用户无任何 per-algo 记录)
+        flat_f = user_dir / "skip_reason.json"
+        if not flat_f.exists():
             continue
         try:
-            info = _json.loads(skip_f.read_text(encoding="utf-8"))
+            info = _json.loads(flat_f.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"  [WARN] 读取 {skip_f} 失败: {e}")
+            print(f"  [WARN] 读取 {flat_f} 失败: {e}")
             continue
-        row = {"user_id": user_dir.name}
+        row = {"user_id": user_dir.name, "algo": "flat"}
         row.update(info)
         rows.append(row)
     if not rows:
         return None, 0
-    # 列顺序: user_id, skip_reason, detail, 其余字段按出现顺序
-    fixed = ["user_id", "skip_reason", "detail"]
+    # 列顺序: user_id, algo, skip_reason, detail, 其余字段按出现顺序
+    fixed = ["user_id", "algo", "skip_reason", "detail"]
     other = []
     for r in rows:
         for k in r.keys():
@@ -603,25 +640,28 @@ def collect_skip_reasons(output_dir: Path, summary_dir: Path):
 
 
 def aggregate_metrics(output_dir: Path, summary_dir: Path):
-    """[v6.12.6+v6.15.0-graceful-v9] 汇总所有用户指标到单一 summary_metrics_all_users.csv
+    """[v15 算法维度] 汇总所有用户 × 算法的指标到 summary_metrics_all_users.csv
 
-    新目录结构:
+    v15 新目录结构 (算法维度子目录):
       output_dir (= artifacts/) 下:
-        trains/<user_id>/{train_val_metrics.csv, test_metrics.csv, skip_reason.json, ...}
-        infers/<user_id>/{inference_metrics.csv, ...}
+        trains/<user_id>/<algo>/{train_val_metrics.csv, test_metrics.csv, skip_reason.json, ...}
+        infers/<user_id>/<algo>/{inference_metrics.csv, ...}
+    兼容旧扁平布局 (algo 列记 "flat"):
+        trains/<user_id>/{train_val_metrics.csv, ...}
 
     输出: artifacts/summary_metrics_all_users.csv
-      每用户 4 行 (stage = train / val / test / inference), 仅最终主模型:
-        train / val / test  → main
-        inference           → main_final (退化 main)
-      列: user_id, stage, status, Accuracy, Precision, Recall, F1, AUC,
+      每用户 × 每算法 4 行 (stage = train / val / test / inference):
+        主模型类算法 (main/v14) 优选 model: main (train/val/test) / main_final (inference)
+        rf 算法优选 model: rf
+      列: user_id, algo, stage, status, Accuracy, Precision, Recall, F1, AUC,
           TN, FP, FN, TP, MAE_W, RMSE_W, SAE, NDE,
           kWh_true, kWh_pred, kWh_err, n_samples
 
-    软跳过用户 4 行均为占位 (指标 NaN, status='soft_skip:<reason>'),
+    软跳过算法 4 行均为占位 (指标 NaN, status='soft_skip:<reason>'),
     无推理用户的 inference 行为占位 (status='no_inference').
     """
     import json as _json
+    from algorithms.registry import ALGORITHM_NAMES
     summary_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 列定义 ----
@@ -631,23 +671,31 @@ def aggregate_metrics(output_dir: Path, summary_dir: Path):
         "MAE_W", "RMSE_W", "SAE", "NDE",
         "kWh_true", "kWh_pred", "kWh_err", "n_samples",
     ]
-    HEADER_COLS = ["user_id", "stage", "status"] + METRIC_COLS
+    HEADER_COLS = ["user_id", "algo", "stage", "status"] + METRIC_COLS
     INT_COLS = {"TN", "FP", "FN", "TP", "n_samples"}
 
-    # 各 stage 的源 CSV 与所在子目录 + 模型优选顺序
-    # (stage_key, parent_subdir, src_csv_name, split_val_in_csv, model_preference)
+    # 各 stage 的源 CSV 与所在子目录
+    # (stage_key, parent_subdir, src_csv_name, split_val_in_csv)
     STAGE_PLAN = [
-        ("train",     "trains", "train_val_metrics.csv", "train",     ["main"]),
-        ("val",       "trains", "train_val_metrics.csv", "val",       ["main"]),
-        ("test",      "trains", "test_metrics.csv",      "test",      ["main"]),
-        ("inference", "infers", "inference_metrics.csv", "inference", ["main_final", "main"]),
+        ("train",     "trains", "train_val_metrics.csv", "train"),
+        ("val",       "trains", "train_val_metrics.csv", "val"),
+        ("test",      "trains", "test_metrics.csv",      "test"),
+        ("inference", "infers", "inference_metrics.csv", "inference"),
     ]
+    # 各算法模型优选顺序 (train/val/test 与 inference 分开)
+    _ALGO_MODEL_PREF = {
+        "main": {"tvt": ["main"],                "inf": ["main_final", "main"]},
+        "v14":  {"tvt": ["main"],                "inf": ["main_final", "main"]},
+        "rf":   {"tvt": ["rf"],                  "inf": ["rf"]},
+        "flat": {"tvt": ["main"],                "inf": ["main_final", "main"]},
+    }
 
-    def _empty_row(uid: str, stage: str, status: str) -> dict:
+    def _empty_row(uid: str, algo: str, stage: str, status: str) -> dict:
         row = {c: None for c in HEADER_COLS}
         row["user_id"] = uid
-        row["stage"]   = stage
-        row["status"]  = status
+        row["algo"] = algo
+        row["stage"] = stage
+        row["status"] = status
         return row
 
     # 收集所有用户 id (取 trains/ 与 infers/ 子目录并集)
@@ -662,74 +710,112 @@ def aggregate_metrics(output_dir: Path, summary_dir: Path):
                     all_users.add(d.name)
 
     rows = []
-    src_cache: dict = {}  # (user_id, parent_subdir, src_csv) -> DataFrame or None
+    src_cache: dict = {}  # (user_id, algo, parent_subdir, src_csv) -> DataFrame or None
 
-    def _read_metrics_csv(uid: str, parent_subdir: str, src_csv_name: str):
-        key = (uid, parent_subdir, src_csv_name)
+    def _read_metrics_csv(uid: str, algo: str, parent_subdir: str, src_csv_name: str):
+        key = (uid, algo, parent_subdir, src_csv_name)
         if key in src_cache:
             return src_cache[key]
-        f = output_dir / parent_subdir / uid / src_csv_name
+        if algo == "flat":
+            f = output_dir / parent_subdir / uid / src_csv_name
+        else:
+            f = output_dir / parent_subdir / uid / algo / src_csv_name
         if not f.exists():
             src_cache[key] = None
             return None
         try:
             src_cache[key] = pd.read_csv(f)
         except Exception as e:
-            print(f"  [WARN] {uid}: 读取 {f.name} 失败: {e}")
+            print(f"  [WARN] {uid}/{algo}: 读取 {f.name} 失败: {e}")
             src_cache[key] = None
         return src_cache[key]
 
+    def _discover_user_algos(uid: str):
+        """返回 [(algo, skip_reason_or_None), ...] (新布局 per-algo; 旧布局 flat)."""
+        entries = []
+        t_dir = train_root / uid
+        if t_dir.exists():
+            found_per_algo = False
+            for d in sorted(t_dir.iterdir()):
+                if d.is_dir() and d.name in ALGORITHM_NAMES:
+                    found_per_algo = True
+                    skip = None
+                    sf = d / "skip_reason.json"
+                    if sf.exists():
+                        try:
+                            skip = _json.loads(sf.read_text(encoding="utf-8")) \
+                                .get("skip_reason", "skipped")
+                        except Exception:
+                            skip = "skipped"
+                    entries.append((d.name, skip))
+            if not found_per_algo:
+                # 旧扁平布局兼容
+                skip = None
+                flat_sf = t_dir / "skip_reason.json"
+                if flat_sf.exists():
+                    try:
+                        skip = _json.loads(flat_sf.read_text(encoding="utf-8")) \
+                            .get("skip_reason", "skipped")
+                    except Exception:
+                        skip = "skipped"
+                entries.append(("flat", skip))
+        # infers 侧算法目录补充 (仅推理产出的算法)
+        i_dir = infer_root / uid
+        if i_dir.exists():
+            for d in sorted(i_dir.iterdir()):
+                if d.is_dir() and d.name in ALGORITHM_NAMES \
+                        and not any(a == d.name for a, _ in entries):
+                    entries.append((d.name, None))
+        if not entries:
+            entries.append(("flat", None))
+        return entries
+
     for user_id in sorted(all_users):
-        # 先看是否软跳过
-        skip_reason = None
-        skip_f = train_root / user_id / "skip_reason.json" if train_root.exists() else None
-        if skip_f is not None and skip_f.exists():
-            try:
-                skip_reason = _json.loads(skip_f.read_text(encoding="utf-8")).get("skip_reason", "skipped")
-            except Exception:
-                skip_reason = "skipped"
+        for algo, skip_reason in _discover_user_algos(user_id):
+            pref = _ALGO_MODEL_PREF.get(algo, _ALGO_MODEL_PREF["flat"])
+            for stage, parent_subdir, src_csv, split_val in STAGE_PLAN:
+                # 软跳过算法: 全 4 stage 都是占位
+                if skip_reason is not None:
+                    rows.append(_empty_row(user_id, algo, stage, f"soft_skip:{skip_reason}"))
+                    continue
 
-        for stage, parent_subdir, src_csv, split_val, model_pref in STAGE_PLAN:
-            # 软跳过用户: 全 4 stage 都是占位
-            if skip_reason is not None:
-                rows.append(_empty_row(user_id, stage, f"soft_skip:{skip_reason}"))
-                continue
+                df = _read_metrics_csv(user_id, algo, parent_subdir, src_csv)
+                if df is None or len(df) == 0:
+                    # 没源 csv: 训练阶段 = no_train_metrics, 推理阶段 = no_inference
+                    placeholder = ("no_inference" if parent_subdir == "infers"
+                                   else f"no_{stage}_metrics")
+                    rows.append(_empty_row(user_id, algo, stage, placeholder))
+                    continue
+                if "split" not in df.columns or "model" not in df.columns:
+                    rows.append(_empty_row(user_id, algo, stage, f"bad_{stage}_csv"))
+                    continue
+                df_s = df[df["split"] == split_val]
+                if len(df_s) == 0:
+                    rows.append(_empty_row(user_id, algo, stage, f"no_{stage}_rows"))
+                    continue
 
-            df = _read_metrics_csv(user_id, parent_subdir, src_csv)
-            if df is None or len(df) == 0:
-                # 没源 csv: 训练阶段 = no_train_metrics, 推理阶段 = no_inference
-                placeholder = "no_inference" if parent_subdir == "infers" else f"no_{stage}_metrics"
-                rows.append(_empty_row(user_id, stage, placeholder))
-                continue
-            if "split" not in df.columns or "model" not in df.columns:
-                rows.append(_empty_row(user_id, stage, f"bad_{stage}_csv"))
-                continue
-            df_s = df[df["split"] == split_val]
-            if len(df_s) == 0:
-                rows.append(_empty_row(user_id, stage, f"no_{stage}_rows"))
-                continue
+                # 按算法模型优选顺序找
+                model_pref = pref["inf"] if stage == "inference" else pref["tvt"]
+                chosen = None
+                chosen_model = None
+                for m in model_pref:
+                    sub = df_s[df_s["model"] == m]
+                    if len(sub) > 0:
+                        chosen = sub
+                        chosen_model = m
+                        break
+                if chosen is None:
+                    first_model = df_s["model"].iloc[0]
+                    chosen = df_s[df_s["model"] == first_model]
+                    chosen_model = first_model
 
-            # 按模型优选顺序找
-            chosen = None
-            chosen_model = None
-            for m in model_pref:
-                sub = df_s[df_s["model"] == m]
-                if len(sub) > 0:
-                    chosen = sub
-                    chosen_model = m
-                    break
-            if chosen is None:
-                first_model = df_s["model"].iloc[0]
-                chosen = df_s[df_s["model"] == first_model]
-                chosen_model = first_model
-
-            row = _empty_row(user_id, stage, f"ok:{chosen_model}")
-            for _, r in chosen.iterrows():
-                mname = r.get("metric")
-                mval  = r.get("value")
-                if mname in METRIC_COLS:
-                    row[mname] = mval
-            rows.append(row)
+                row = _empty_row(user_id, algo, stage, f"ok:{chosen_model}")
+                for _, r in chosen.iterrows():
+                    mname = r.get("metric")
+                    mval = r.get("value")
+                    if mname in METRIC_COLS:
+                        row[mname] = mval
+                rows.append(row)
 
     if not rows:
         return []
@@ -743,6 +829,100 @@ def aggregate_metrics(output_dir: Path, summary_dir: Path):
     out = summary_dir / "summary_metrics_all_users.csv"
     df_all.to_csv(out, index=False, encoding="utf-8-sig")
     return [("summary_metrics_all_users.csv", len(df_all), out)]
+
+
+
+def resolve_user_run_config(info, time_filter_config, cli_algorithms="",
+                            cli_mode="", cli_v14_flags="", verbose=True):
+    """[v15] 解析单用户的全部运行配置 (供扫描阶段显示 + 执行阶段复用).
+
+    覆盖: 时段过滤 (train/infer) / d87 守卫 / per-split 过滤 / common 覆盖 /
+    v14 增强开关 / 多算法选择 (CLI 覆盖 > time_filters 配置 > 内置默认).
+
+    返回 dict: {train_spec, infer_spec, guard, splits_spec, common_overrides,
+               v14_flags, algorithms, algo_mode}
+    """
+    uid = info["folder_name"]
+    out = {"train_spec": "", "infer_spec": "", "guard": "", "splits_spec": "",
+           "common_overrides": "", "v14_flags": cli_v14_flags or "",
+           "algorithms": "main,rf", "algo_mode": "multi"}
+    try:
+        from time_filter_utils import (get_user_stage_spec, spec_to_cli_arg,
+                                       spec_summary, get_user_guard_enabled,
+                                       load_splits_time_filter, splits_spec_to_cli_arg,
+                                       splits_spec_summary,
+                                       get_user_common_overrides,
+                                       get_user_v14_flags,
+                                       get_user_algorithms_selection)
+    except Exception as e:
+        if verbose:
+            print(f"    [v15 WARN] 运行配置解析失败 ({e}), 使用默认")
+        return out
+
+    # ---- 时段过滤 / 守卫 / per-split / common 覆盖 / v14 开关 (均依赖配置) ----
+    if time_filter_config:
+        _train_spec = get_user_stage_spec(time_filter_config, uid, "train")
+        _infer_spec = get_user_stage_spec(time_filter_config, uid, "infer")
+        out["train_spec"] = spec_to_cli_arg(_train_spec)
+        out["infer_spec"] = spec_to_cli_arg(_infer_spec)
+        if verbose and (_train_spec is not None or _infer_spec is not None):
+            print(f"  [v12] 时段过滤: train={spec_summary(_train_spec)}, "
+                  f"infer={spec_summary(_infer_spec)}")
+
+        _guard_val = get_user_guard_enabled(time_filter_config, uid)
+        if _guard_val is True:
+            out["guard"] = "true"
+            if verbose:
+                print(f"  [v13] d87 守卫: 强制开启 (来自配置)")
+        elif _guard_val is False:
+            out["guard"] = "false"
+            if verbose:
+                print(f"  [v13] d87 守卫: 强制关闭 (来自配置)")
+        elif verbose:
+            print(f"  [v13] d87 守卫: 未指定, 走全局 D87_ADAPTIVE_GUARD_ENABLED (可能被自动降级)")
+
+        _splits_spec = load_splits_time_filter(time_filter_config, uid)
+        if _splits_spec is not None:
+            out["splits_spec"] = splits_spec_to_cli_arg(_splits_spec)
+            if verbose:
+                print(f"  [v13] per-split time_filter: {splits_spec_summary(_splits_spec)}")
+
+        _common_overrides = get_user_common_overrides(time_filter_config, uid)
+        if _common_overrides:
+            out["common_overrides"] = json.dumps(_common_overrides, ensure_ascii=False)
+            if verbose:
+                print(f"  [v13.5] common 覆盖 {len(_common_overrides)} 项: "
+                      f"{', '.join(f'{k}={v}' for k, v in _common_overrides.items())}")
+
+        if not out["v14_flags"]:
+            _v14_dict = get_user_v14_flags(time_filter_config, uid)
+            if any(_v14_dict.values()):
+                out["v14_flags"] = json.dumps(_v14_dict, ensure_ascii=False)
+                if verbose:
+                    print(f"  [v14] v14 增强配置: enabled={_v14_dict.get('v14_enable', False)}")
+
+    # ---- [v15] 多算法选择解析 (与 time_filter_config 解耦: CLI 可独立生效) ----
+    _v14_hint_user = False
+    try:
+        if out["v14_flags"].strip():
+            _v14_cfg = json.loads(out["v14_flags"])
+            if isinstance(_v14_cfg, dict):
+                _v14_hint_user = bool(_v14_cfg.get("v14_enable",
+                                      _v14_cfg.get("v14_enabled", False)))
+    except Exception:
+        pass
+    _sel, _mode, _warns = get_user_algorithms_selection(
+        time_filter_config or {}, uid,
+        cli_algorithms=(cli_algorithms or None),
+        cli_mode=(cli_mode or None),
+        v14_hint=_v14_hint_user)
+    out["algorithms"] = ",".join(_sel)
+    out["algo_mode"] = _mode
+    if verbose:
+        for _w in _warns:
+            print(f"    [v15 WARN] {_w}")
+        print(f"  [v15] 算法计划: {out['algorithms']} (mode={out['algo_mode']})")
+    return out
 
 
 def main():
@@ -780,6 +960,12 @@ def main():
                          "默认 False = fail 用户续跑时会重跑")
     ap.add_argument("--v14-flags", default="",
                     help="[v14] JSON 字符串, 透传给 run_user_pipeline.py 的 v14 开关")
+    # [v15] 多算法运行模式 (优先级: CLI > time_filters 配置 algorithms 字段 > 内置默认)
+    ap.add_argument("--algorithms", default="",
+                    help="[v15] 逗号分隔算法列表 (main/rf/v14, 支持 'all' 别名), 覆盖 time_filters 配置")
+    ap.add_argument("--algo-mode", default="",
+                    choices=["", "single", "multi", "all"],
+                    help="[v15] 运行模式: single=单模型 / multi=多模型选择性 / all=全部模型遍历")
     args = ap.parse_args()
 
     # [v12] 加载时段过滤配置
@@ -834,6 +1020,14 @@ def main():
         if u["errors"]:
             for e in u["errors"]:
                 print(f"    └─ {e}")
+        # [v15] 扫描阶段解析并存储该用户运行配置 (dry-run 也能看到算法计划)
+        if ok:
+            u["run_cfg"] = resolve_user_run_config(
+                u, time_filter_config,
+                cli_algorithms=getattr(args, "algorithms", "") or "",
+                cli_mode=getattr(args, "algo_mode", "") or "",
+                cli_v14_flags=getattr(args, "v14_flags", "") or "",
+                verbose=True)
         (runnable if ok else skipped).append(u)
 
     # [v13.17] 断点续跑: 在 dry-run 之前应用, 让计划也反映真实待跑列表
@@ -885,57 +1079,22 @@ def main():
         print(f"\n{'#'*70}\n  [{i}/{len(runnable)}] {u['folder_name']} (target={u['target_col']})")
         print(f"{'#'*70}")
 
-        # [v12] 该用户的时段过滤规格 (train / infer 独立)
-        _train_spec_str = ""
-        _infer_spec_str = ""
-        _guard_enabled = ""   # [v13] 空 = 未指定
-        _splits_spec_str = ""   # [v13] per-split 过滤
-        _common_overrides_str = ""   # [v13.5] 8 项 common 常量覆盖
-        _v14_flags_str = getattr(args, "v14_flags", "")   # [v14] v14 增强开关
-        if time_filter_config:
-            from time_filter_utils import (get_user_stage_spec, spec_to_cli_arg,
-                                            spec_summary, get_user_guard_enabled,
-                                            load_splits_time_filter, splits_spec_to_cli_arg,
-                                            splits_spec_summary,
-                                            get_user_common_overrides,
-                                            get_user_v14_flags)
-            _train_spec = get_user_stage_spec(time_filter_config, u["folder_name"], "train")
-            _infer_spec = get_user_stage_spec(time_filter_config, u["folder_name"], "infer")
-            _train_spec_str = spec_to_cli_arg(_train_spec)
-            _infer_spec_str = spec_to_cli_arg(_infer_spec)
-            if _train_spec is not None or _infer_spec is not None:
-                print(f"  [v12] 时段过滤: train={spec_summary(_train_spec)}, "
-                      f"infer={spec_summary(_infer_spec)}")
-            # [v13] 用户级 d87 守卫开关
-            _guard_val = get_user_guard_enabled(time_filter_config, u["folder_name"])
-            if _guard_val is True:
-                _guard_enabled = "true"
-                print(f"  [v13] d87 守卫: 强制开启 (来自配置)")
-            elif _guard_val is False:
-                _guard_enabled = "false"
-                print(f"  [v13] d87 守卫: 强制关闭 (来自配置)")
-            else:
-                print(f"  [v13] d87 守卫: 未指定, 走全局 D87_ADAPTIVE_GUARD_ENABLED (可能被自动降级)")
-            # [v13] per-split time_filter (train/val/test 独立)
-            _splits_spec = load_splits_time_filter(time_filter_config, u["folder_name"])
-            if _splits_spec is not None:
-                _splits_spec_str = splits_spec_to_cli_arg(_splits_spec)
-                print(f"  [v13] per-split time_filter: {splits_spec_summary(_splits_spec)}")
-            # [v13.5] 8 项 common 常量覆盖 (on_thr_w / split_ratios / split_strategy /
-            # post_min_on / post_fill_short_off / weather_latitude / weather_longitude /
-            # use_weather_features / use_temp_based_season)
-            _common_overrides = get_user_common_overrides(time_filter_config, u["folder_name"])
-            if _common_overrides:
-                import json as _json_batch
-                _common_overrides_str = _json_batch.dumps(_common_overrides, ensure_ascii=False)
-                print(f"  [v13.5] common 覆盖 {len(_common_overrides)} 项: "
-                      f"{', '.join(f'{k}={v}' for k, v in _common_overrides.items())}")
-            if not _v14_flags_str:
-                _v14_dict = get_user_v14_flags(time_filter_config, u["folder_name"])
-                if any(_v14_dict.values()):
-                    import json as _json_batch
-                    _v14_flags_str = _json_batch.dumps(_v14_dict, ensure_ascii=False)
-                    print(f"  [v14] v14 增强配置: enabled={_v14_dict.get('v14_enable', False)}")
+        # [v15] 使用扫描阶段解析好的运行配置 (时段过滤/守卫/切分/common覆盖/v14/算法选择)
+        _uc = u.get("run_cfg") or resolve_user_run_config(
+            u, time_filter_config,
+            cli_algorithms=getattr(args, "algorithms", "") or "",
+            cli_mode=getattr(args, "algo_mode", "") or "",
+            cli_v14_flags=getattr(args, "v14_flags", "") or "",
+            verbose=False)
+        _train_spec_str = _uc["train_spec"]
+        _infer_spec_str = _uc["infer_spec"]
+        _guard_enabled = _uc["guard"]
+        _splits_spec_str = _uc["splits_spec"]
+        _common_overrides_str = _uc["common_overrides"]
+        _v14_flags_str = _uc["v14_flags"]
+        _algo_sel_names = _uc["algorithms"].split(",")
+        _algo_mode = _uc["algo_mode"]
+        print(f"  [v15] 算法计划: {_uc['algorithms']} (mode={_uc['algo_mode']})")
 
         t0 = datetime.now()
         status, msg = run_single_user(u, output_dir, args.skip_existing, log_path,
@@ -945,7 +1104,9 @@ def main():
                                        guard_enabled=_guard_enabled,
                                        splits_time_filter_spec=_splits_spec_str,
                                        common_overrides_spec=_common_overrides_str,
-                                       v14_flags_spec=_v14_flags_str)
+                                       v14_flags_spec=_v14_flags_str,
+                                       algorithms=",".join(_algo_sel_names),
+                                       algo_mode=_algo_mode)
         t1 = datetime.now()
         dt = (t1 - t0).total_seconds()
         icon  = STATUS_ICON.get(status, "?")
@@ -976,6 +1137,7 @@ def main():
                 "duration_s": round(dt, 2),
                 "message": (msg or "").replace("\n", " ")[:500],   # 单行且截断防超宽
                 "target_col": u["target_col"] or "",
+                "algorithms": ",".join(_algo_sel_names),           # [v15] 本次算法计划
                 "run_id": run_id,
             }, logger_print=print)
         except Exception as _wse:
