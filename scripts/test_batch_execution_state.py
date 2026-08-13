@@ -29,8 +29,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# 直接 import 目标模块的函数 (从 run_batch_users.py)
-from run_batch_users import (
+# 直接 import 目标模块的函数 (从 data_output.py, [v16] 数据输出模块统一接口)
+from data_output import (
     _load_execution_state, _get_completed_users, _upsert_execution_state,
     _execution_state_path, _EXECUTION_STATE_CSV_NAME, _EXECUTION_STATE_COLS,
 )
