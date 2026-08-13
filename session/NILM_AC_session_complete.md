@@ -6204,3 +6204,23 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
   - 分支：`arena/019ff4a0-nilm-test`
   - 关键交付件：`项目技术方案说明书_数据架构与核心算法全景规范.docx`
   - 关键状态文件：`REPORT_TEST.md`, `STATUS.md`, `session/NILM_AC_session_complete.md`
+
+---
+
+## [2026-08-13] 会话纪要（v15 多算法解耦重构：模块化隔离 + 三种运行模式 + 算法维度产物体系）
+- 目标：对现有代码实施重构，各功能模块解耦隔离；新增多算法模型支撑能力（主模型 L4 / RF 基线 / v14 三类算法代码模块解耦隔离，统一输入输出接口）；开放配置入口支持三种自定义运行模式（指定单模型 single / 多模型选择性 multi / 全部模型遍历 all）；产物输出按算法维度子目录隔离归档。
+- 完成项：
+  1. 新增 `scripts/algorithms/` 多算法统一插件框架：`base.py`（AlgorithmModule 抽象基类 + AlgoContext 统一输入输出接口）、`registry.py`（注册中心 + `resolve_algorithm_selection()` 三种模式解析，优先级 CLI > time_filters 配置 > 内置默认 main+rf）、`main_l4.py` / `rf_baseline.py` / `v14_enhanced.py` 三个解耦算法模块。
+  2. 训练解耦门控：`03_train.py` 支持 `NILM_ALGO_SELECT`（main / rf / main+rf），rf 产出自包含 `rf_bundle.pkl`；默认行为与重构前完全一致。
+  3. 评估/推理解耦：`04_evaluate.py` / `05_inference.py` 支持 `--algo main|rf` + `--no-baseline`；修复 v14 三阶段特征环境一致性（训练 170 维 vs 评估 137 维维度不匹配）。
+  4. 流水线编排重构：`run_user_pipeline.py` 按算法序列逐个执行，算法间故障隔离（退出码 0/10/1 三态契约），共享数据执行期保留 + 收尾统一清理。
+  5. 批量层改造：`run_batch_users.py` 新增 `--algorithms` / `--algo-mode`；扫描阶段即显示每用户算法计划（dry-run 可见）；汇总表/软跳过表/状态表均增加算法维度列；旧扁平布局聚合兼容（algo=flat）。
+  6. 配置入口：`time_filter_utils.py` 新增 `get_user_algorithms_config` / `get_user_algorithms_selection`；`data/time_filters.example.json` 增加 algorithms 字段示例。
+  7. 验证：单元测试 24 项 + 合成数据冒烟 14 用例 + 既有单测回归 + 真实数据 5 用户 dry-run 全部通过。
+- 关键决策：见 STATUS.md「决策记录」（四层解耦口径、三种模式语义、共享状态治理、v14 特征一致性契约、故障隔离退出码契约）。
+- 未决问题：无。Word 技术方案文档的多算法章节同步留待用户确认后追加。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 新增：`scripts/algorithms/`（5 文件）、`scripts/test_algorithm_registry.py`、`scripts/test_algo_config.py`
+  - 修改：`scripts/03_train.py`、`04_evaluate.py`、`05_inference.py`、`run_user_pipeline.py`、`run_batch_users.py`、`time_filter_utils.py`、`data/time_filters.example.json`
+  - 文档：`STATUS.md`、`REPORT_TEST.md`（v15 专题）、本纪要

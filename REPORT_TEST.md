@@ -322,3 +322,118 @@
 ### 5.3 严格错误边界与优雅降级控制规则 (`WARN + Fallback`)
 1. **智能数值/布尔表达兼容**：支持数字字符与多语言逻辑字面量（`"True"`, `"yes"`, `"1"`, `"on"`等）至合法数值与布尔类型的非严格兼容转换。
 2. **非崩溃安全警报与系统缺省回归**：当用户传入超范围非合规值，程序均以轻量非侵入方式抛出 `UserWarning` 并剔除此值，平滑重置至下层系统确立的基础合规值兜底继续，保证业务长链高弹运行不断线。
+
+---
+
+# [2026-08-13] 专题：v15 多算法解耦重构报告（模块化隔离 + 三种运行模式 + 算法维度产物体系）
+
+> **专题类型**：工程重构 / 多算法支撑能力 / 配置与产物规范
+> **目标**：对现有流水线代码实施重构，实现各功能模块解耦隔离；新增多算法模型支撑能力（主模型 main / RF 基线 rf / v14 增强版三类算法代码模块解耦隔离，统一输入输出接口）；开放配置入口支持三种自定义运行模式（指定单模型 single、多模型选择性 multi、全部模型遍历 all）；产物输出按算法维度子目录隔离归档。
+
+## 1. 重构后的四层解耦架构
+
+```
++------------------------------------------------------------------------------------------+
+|  批量调度层  run_batch_users.py                                                          |
+|   --algorithms main,rf,v14  --algo-mode single|multi|all   (CLI, 覆盖配置)               |
+|   time_filters 配置 algorithms 字段 (每用户 / _default)                                  |
+|   summary_metrics_all_users.csv 新增 algo 列 (每用户×每算法 4 行)                         |
++------------------------------------------------------------------------------------------+
+                                     |  解析为 [算法序列]
+                                     v
++------------------------------------------------------------------------------------------+
+|  单用户流水线层  run_user_pipeline.py  (数据准备与算法执行解耦)                            |
+|   共享数据准备 (02 对齐 / 训练前分析 / 推理数据准备) 只跑一次                                |
+|   for algo in 算法序列:  [训练/复用 -> 评估 -> 推理 -> 按算法归档]   (故障隔离)            |
++------------------------------------------------------------------------------------------+
+                                     |  统一接口
+                                     v
++------------------------------------------------------------------------------------------+
+|  算法插件框架  scripts/algorithms/  (AlgorithmModule 抽象基类 + 注册中心)                 |
+|   main_l4.py (主模型)   rf_baseline.py (RF 基线)   v14_enhanced.py (v14 增强)             |
+|   统一契约: 三阶段脚本 / 隔离环境 / CLI 参数 / 模型完整性文件清单 / 产物子目录              |
++------------------------------------------------------------------------------------------+
+                                     |  --algo / NILM_ALGO_SELECT 门控
+                                     v
++------------------------------------------------------------------------------------------+
+|  阶段脚本层  02_align (共享) / 03_train (NILM_ALGO_SELECT 训练门控)                        |
+|             04_evaluate (--algo main|rf) / 05_inference (--algo main|rf)                 |
++------------------------------------------------------------------------------------------+
+```
+
+四层隔离实现口径：
+1. **代码模块隔离**：每个算法一个模块文件，互不 import 对方实现；新算法 = 继承 `AlgorithmModule` + 注册一行。
+2. **训练门控隔离**：`03_train.py` 由环境变量 `NILM_ALGO_SELECT`（main / rf / main+rf，默认 main+rf 与重构前完全一致）决定本次训练范围；rf-only 产出自包含 `rf_bundle.pkl`（含 scaler / 特征列 / ON 阈值 / 切分日期等统一接口所需全部上下文）。
+3. **运行环境隔离**：每个算法的三阶段子进程拥有独立 env（v14 的 monkey-patch 不再泄漏到其他算法）；v14 物理特征环境在训练/评估/推理三阶段一致注入（特征一致性契约，规避 scaler 维度不匹配）。
+4. **产物隔离**：模型与产物按算法子目录归档（见第 3 节）；main 与 v14 即使共用主模型槽位也互不覆盖。
+
+## 2. 配置入口与三种运行模式
+
+### 2.1 time_filters 配置扩展（用户级或 `_default` 级）
+
+```json
+"algorithms": {
+  "mode": "all",
+  "selected": ["main", "rf"],
+  "main": {}, "rf": {}, "v14": {}
+}
+```
+
+- `mode`: `single`（指定单模型执行，取 `selected` 第一个）/ `multi`（多模型选择性执行，`selected` 原样执行）/ `all`（全部注册算法按注册顺序遍历，忽略 `selected`）
+- `selected`: 算法名列表；`<algo>` 子对象为算法级私有覆盖预留位
+- 优先级：CLI `--algorithms` / `--algo-mode` > 配置 `algorithms` 字段 > 内置默认（main+rf，与重构前行为一致）
+- 兼容：无显式配置且用户 v14 增强开关开启时，默认列表自动追加 v14（旧 `--v14-flags` 语义保持）
+
+### 2.2 CLI 入口（批量层与单用户流水线层均支持）
+
+```bash
+python scripts/run_batch_users.py --algorithms rf --algo-mode single          # 指定单模型
+python scripts/run_batch_users.py --algorithms main,v14 --algo-mode multi     # 多模型选择性
+python scripts/run_batch_users.py --algo-mode all                             # 全部模型遍历
+python scripts/run_batch_users.py --time-filter-config data/time_filters.json # 或按用户配置
+python scripts/run_user_pipeline.py ... --algorithms main,rf --algo-mode all  # 单用户层同入口
+```
+
+解析实现统一收敛在 `scripts/algorithms/registry.py::resolve_algorithm_selection()`（含非法模式/未注册算法 WARN 剔除与空兜底）。
+
+## 3. 产物输出结构（算法维度子目录）
+
+```
+models/
+  <user_id>/
+    main/    nilm_ac_two_stage.pkl, model_meta.json, scaler.pkl,
+             stage1_classifier.pkl, stage2_moe_bundle.pkl
+    rf/      rf_bundle.pkl, baseline_rf.pkl, rf_bundle_meta.json
+    v14/     (与 main 同构 5 件套, 独立归档互不覆盖)
+artifacts/
+  trains/<user_id>/
+    train_on_periods.csv / train_on_periods_daily.csv   (用户级数据视图, 算法无关)
+    main/  train_pred.csv, val_pred.csv, test_pred.csv,
+           train_val_metrics.csv, test_metrics.csv, ... 
+    rf/    train_pred_rf.csv, val_pred_rf.csv, test_pred_rf.csv, ...
+    v14/   (主模型槽位同名产物, 独立归档)
+  infers/<user_id>/
+    infer_on_periods.csv / infer_on_periods_daily.csv   (用户级数据视图)
+    main/  predictions/inference_result.csv, metrics/inference_metrics.csv, ...
+    rf/    predictions/inference_result.csv (rf 口径), ...
+    v14/   ...
+  summary_metrics_all_users.csv   [新增 algo 列] 每用户×每算法 4 行 (train/val/test/inference)
+  skipped_users.csv               [新增 algo 列] 按算法维度收集软跳过原因
+  batch_execution_state.csv       [新增 algorithms 列] 记录本次算法计划
+```
+
+兼容性：旧扁平布局（`trains/<user>/*.csv` 直放）聚合时以 `algo=flat` 识别，全部历史产物无需迁移即可汇总。
+
+## 4. 行为契约（验证过的关键语义）
+
+- **模型复用**：按算法各自的 `required_model_files` 契约检查；main 兼容旧扁平模型目录；全部所选算法模型完整时跳过 02 对齐。
+- **故障隔离**：单算法软跳过（数据质量门 11/12/13）或硬失败不阻塞其他算法；05 失败时部分归档训练侧产物，不丢弃已训模型；退出码 0=≥1 算法成功 / 10=全部软跳过 / 1=无算法成功。
+- **共享状态治理**：`aligned_15min.csv` / `merged_*.csv` / `infer_*.csv` / `skip_reason.json` 在多算法执行期保留（`_CLEANUP_WHITELIST` 扩展），流水线收尾统一清理。
+- **汇总模型优选**：train/val/test 阶段 main/v14→`main`、rf→`rf`；inference 阶段 main/v14→`main_final`→`main`、rf→`rf`。
+
+## 5. 验证记录
+
+- 单元测试：`scripts/test_algorithm_registry.py`（13 项，注册完整性/接口契约/三模式解析/CLI 覆盖/v14 提示）+ `scripts/test_algo_config.py`（11 项，配置命中/_default 回退/非法防御/摘要）全部通过。
+- 合成数据冒烟：03 训练门控 3 用例（rf-only 隔离 / main-only 隔离 / 默认向后兼容）、04/05 双链路 2 用例（main/rf 独立评估与推理，产物互不交叉）、流水线编排 4 用例（single/multi/all/模型复用，含 v14 三阶段特征一致性）、批量层 5 用例（dry-run 计划、CLI multi 全流程、配置驱动 single、CLI 覆盖 all、旧扁平聚合兼容）全部通过。
+- 回归：既有 `test_batch_execution_state.py` / `test_composite_target_col.py` / `test_daily_raw_counts.py` / `test_min_w_column.py` 全部通过；真实数据目录 5 用户 dry-run 扫描正常。
+- **遗留问题**：暂无。后续新算法接入请按 `scripts/algorithms/` 基类契约实现并在注册表登记。
