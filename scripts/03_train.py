@@ -206,6 +206,37 @@ def main():
             log.info(f"  [v13.5 用户级覆盖] {line}")
 
     log.info("=" * 70)
+    # ============================================================
+    # [v15 多算法重构] 训练解耦门控 NILM_ALGO_SELECT
+    #   "main"    : 仅训练主模型 (跳过 RF 基线)
+    #   "rf"      : 仅训练 RF 基线 (跳过主模型全部环节)
+    #   "main+rf" : 两者都训练 (默认, 与重构前行为完全一致)
+    # NILM_BASELINE_MODE=1 (03b v42 路径) 优先级最高, 保持历史语义不变.
+    # ============================================================
+    _is_baseline_mode = _os.environ.get("NILM_BASELINE_MODE") == "1"
+    if _is_baseline_mode:
+        # 历史行为: v42 训练 + RF 同训 (组件/预测/meta 仍按基线模式跳过)
+        _do_main = True
+        _do_rf = True
+        _algo_select = "main+rf(baseline)"
+    else:
+        _algo_raw = (_os.environ.get("NILM_ALGO_SELECT", "") or "main+rf").strip().lower()
+        _algo_parts = [p for p in _algo_raw.replace("+", ",").replace(" ", ",").split(",")
+                       if p]
+        _do_main = "main" in _algo_parts
+        _do_rf = "rf" in _algo_parts
+        if not (_do_main or _do_rf):
+            log.warning(f"  [v15] NILM_ALGO_SELECT={_algo_raw!r} 非法, 回退 main+rf")
+            _do_main, _do_rf = True, True
+        _algo_select = ("main" if _do_main else "") + ("+rf" if _do_rf else "")
+    _do_main_flag = _do_main
+    if _do_main and not _do_rf:
+        log.info("  [v15 算法解耦] 本次仅训练主模型 (跳过 RF 基线)")
+    elif _do_rf and not _do_main:
+        log.info("  [v15 算法解耦] 本次仅训练 RF 基线 (跳过主模型全部环节)")
+    else:
+        log.info(f"  [v15 算法解耦] 本次训练范围: {_algo_select}")
+
     log.info("Step 3: 模型训练 v5 (温度特征 + 温度驱动季节路由)")
     log.info(f"  [B] 阈值优化: F_beta = {FBETA}, 后处理 min_on={POST_MIN_ON}")
     log.info(f"  [C] 时序特征 (60 维基础)")
@@ -444,586 +475,624 @@ def main():
         X_tr_s = scaler.transform(X_tr)
         X_va_s = scaler.transform(X_va)
 
-    # ---------- 5. Stage-1 分类器 ----------
-    log.info("-" * 70)
-    log.info("[Stage-1] 训练 开/关分类器 GradientBoostingClassifier")
-    log.info(f"  超参: n_estimators=300, max_depth=3, lr=0.05, subsample=0.8")
-    clf = GradientBoostingClassifier(
-        n_estimators=300, max_depth=3, learning_rate=0.05,
-        subsample=0.8, random_state=RANDOM_SEED,
-    )
-    with Timer("Stage-1 训练", log):
-        clf.fit(X_tr_s, s_tr)
-
-    # ---------- 5.1 [B] 阈值优化 (F_beta + 后处理) ----------
-    with Timer(f"[B] Stage-1 阈值搜索 (F{FBETA} + 后处理 min_on={POST_MIN_ON})", log):
-        p_va = clf.predict_proba(X_va_s)[:, 1]
-        result = search_best_threshold(
-            p_va, s_va, beta=FBETA,
-            min_on=POST_MIN_ON,
-            fill_short_off=POST_FILL_SHORT_OFF,
-        )
-        best_thr = result["best_thr"]
-        log.info(f"  最佳阈值 = {best_thr:.3f}   "
-                 f"Val F{FBETA} = {result['best_fbeta']:.4f}")
-
-    # 保存阈值-指标曲线
-    curve_df = pd.DataFrame(result["curve"])
-    curve_path = METRIC_DIR / "threshold_curve_val.csv"
-    curve_df.to_csv(curve_path, index=False, encoding="utf-8-sig")
-    log.info(f"  阈值曲线 -> {curve_path}  ({len(curve_df)} 行)")
-
-    # Train / Val 预测 (含后处理)
-    p_tr = clf.predict_proba(X_tr_s)[:, 1]
-    pred_state_raw_tr = (p_tr >= best_thr).astype(int)
-    pred_state_raw_va = (p_va >= best_thr).astype(int)
-    # 后处理
-    pred_state_tr, _ = apply_postprocess(pred_state_raw_tr,
-                                         np.zeros_like(pred_state_raw_tr),
-                                         POST_MIN_ON, POST_FILL_SHORT_OFF)
-    pred_state_va, _ = apply_postprocess(pred_state_raw_va,
-                                         np.zeros_like(pred_state_raw_va),
-                                         POST_MIN_ON, POST_FILL_SHORT_OFF)
-    log.info(f"  Train: raw_ON={pred_state_raw_tr.sum()}, "
-             f"postproc_ON={pred_state_tr.sum()}, "
-             f"真实_ON={s_tr.sum()}")
-    log.info(f"  Val  : raw_ON={pred_state_raw_va.sum()}, "
-             f"postproc_ON={pred_state_va.sum()}, "
-             f"真实_ON={s_va.sum()}")
-
-    # v6.12.6 单口径分类指标 (用训练标签 ON_THR_W=10W 评估)
-    cls_tr = compute_classification_metrics(s_tr, pred_state_tr, p_tr)
-    cls_va = compute_classification_metrics(s_va, pred_state_va, p_va)
-    log.info(f"  Train cls: {cls_tr}")
-    log.info(f"  Val   cls: {cls_va}")
-
-    # ---------- 6. Stage-2 季节分层 MoE 条件功率回归 (v4) ----------
-    log.info("-" * 70)
-    log.info("[Stage-2] 训练 季节分层 MoE 条件功率回归器")
-    mask_on = s_tr == 1
-    n_on = int(mask_on.sum())
-    log.info(f"  ON 训练样本数: {n_on}")
-
-    # 训练前: 季节分布诊断 (v5 用温度驱动的 season 标签)
-    log.info("  ---- 季节分布诊断 (Train ON 样本) ----")
-    diag = diagnose_seasonal_distribution(sea_tr, y_tr, s_tr, logger=log)
-
-    # [1] 样本权重 (整个 train 集计算, 后续按 mask 取子集)
-    sw_full = None
-    if USE_SAMPLE_WEIGHT and n_on > 0:
-        with Timer("[1] 计算逆密度样本权重 (全局)", log):
-            sw_on = compute_inverse_density_weights(
-                y_tr[mask_on], n_bins=WEIGHT_N_BINS,
-            )
-            # 扩展回全 train 长度 (OFF 样本权重 0, 但本来就不参与回归训练)
-            sw_full = np.zeros_like(y_tr, dtype=float)
-            sw_full[mask_on] = sw_on
-            stats = summarize_weights(y_tr[mask_on], sw_on, n_bins=5)
-            log.info(f"  权重 范围 [{stats['weight_min']:.3f}, "
-                     f"{stats['weight_max']:.3f}], "
-                     f"mean={stats['weight_mean']:.3f}")
-
-    # [2] GBR 工厂函数
-    def make_quantile_reg(alpha):
-        return GradientBoostingRegressor(
-            n_estimators=400, max_depth=3, learning_rate=0.05,
-            subsample=0.8, random_state=RANDOM_SEED,
-            loss="quantile", alpha=alpha,
-        )
-
-    # [A] 季节分层 MoE
-    log.info("  ---- 训练季节专家 ----")
-    moe = SeasonalRegressorBundle(
-        gbr_factory=make_quantile_reg,
-        quantiles=(QUANTILE_LOW, QUANTILE_ALPHA, QUANTILE_HIGH),
-        logger=log,
-    )
-    with Timer("[A] 季节分层 MoE 训练 (3 expert × 3 quantile + 3 fallback)", log):
-        # v5: 用 sea_tr (温度路由) 取代原来的 t_tr (月份路由)
-        moe.fit(X_tr_s, y_tr, s_tr, sea_tr, sample_weight=sw_full)
-
-    # 兼容旧 bundle 的别名 (供下游脚本无缝读取)
-    reg      = moe   # 注意: 这里 reg 已是 MoE 对象, 推理时需传 timestamps
-    # 保留单一 fallback 全局 GBR (向下兼容老推理脚本)
-    reg_global_p50  = moe.fallback[QUANTILE_ALPHA]
-    reg_global_low  = moe.fallback[QUANTILE_LOW]
-    reg_global_high = moe.fallback[QUANTILE_HIGH]
-
-    def predict_combined_moe(X_s, p_state, season_labels):
-        raw_state = (p_state >= best_thr).astype(int)
-        p_med  = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_ALPHA), 0, None)
-        p_low  = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_LOW),  0, None)
-        p_high = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_HIGH), 0, None)
-        state_filt, y_pred_filt = apply_postprocess(
-            raw_state, p_med, POST_MIN_ON, POST_FILL_SHORT_OFF,
-        )
-        return y_pred_filt, state_filt, p_med, p_low, p_high
-
-    y_pred_tr, _, p_med_tr, p_low_tr, p_high_tr = \
-        predict_combined_moe(X_tr_s, p_tr, sea_tr)
-    y_pred_va, _, p_med_va, p_low_va, p_high_va = \
-        predict_combined_moe(X_va_s, p_va, sea_va)
-
-    reg_tr = compute_regression_metrics(y_tr, y_pred_tr)
-    reg_va = compute_regression_metrics(y_va, y_pred_va)
-    log.info(f"  Train reg: {reg_tr}")
-    log.info(f"  Val   reg: {reg_va}")
-
-    # 残差诊断 (按季节细分, 关键!)
-    def log_residual_bias_by_season(y_true, y_pred, s_true, sea, tag):
-        m = s_true == 1
-        if m.sum() == 0:
-            return
-        res_all = y_pred[m] - y_true[m]
-        log.info(f"  [{tag}] ON 整体  残差: 中位={np.median(res_all):+.1f}W "
-                 f"均值={res_all.mean():+.1f}W std={res_all.std():.1f}W "
-                 f"(n={int(m.sum())})")
-        for season in SEASON_LABELS:
-            mm = m & (sea == season)
-            if mm.sum() == 0:
-                continue
-            r = y_pred[mm] - y_true[mm]
-            log.info(f"      + {season:<11} 残差: 中位={np.median(r):+.1f}W "
-                     f"均值={r.mean():+.1f}W std={r.std():.1f}W "
-                     f"(n={int(mm.sum())})")
-
-    log_residual_bias_by_season(y_tr, y_pred_tr, s_tr, sea_tr, "Train")
-    log_residual_bias_by_season(y_va, y_pred_va, s_va, sea_va, "Val  ")
-
-    # ---------- 7. [L4] 训练残差校正层 (在 val 集上学) ----------
-    residual_calib = None
-    if USE_RESIDUAL_CALIB:
+    # ---------- 5~6d. 主模型专属环节 (Stage-1 分类 + 阈值 + MoE + L4 + fallback/L4 指标) ----------
+    # [v15 算法解耦] 仅当本次需要训练主模型时执行; rf-only 时跳过全部主模型环节
+    if _do_main_flag:
+        # ---------- 5. Stage-1 分类器 ----------
         log.info("-" * 70)
-        log.info("[L4] 残差校正层训练 (在 val 集上学习, 不污染主模型)")
-
-        # 计算 val 集的 recent_signal (Top-1 列近 24h 滚动均值)
-        if top_cols and top_cols[0] in df.columns:
-            top1 = df[top_cols[0]].astype(float)
-            recent_24h = top1.rolling(window=96, min_periods=4,
-                                      closed="left").mean().bfill().values
-        else:
-            recent_24h = np.zeros(len(df))
-
-        recent_va = recent_24h[idx_va]
-        # val 的 state_pred (用主模型推理结果)
-        state_pred_va, _ = apply_postprocess(
-            pred_state_raw_va, np.zeros_like(pred_state_raw_va),
-            POST_MIN_ON, POST_FILL_SHORT_OFF,
+        log.info("[Stage-1] 训练 开/关分类器 GradientBoostingClassifier")
+        log.info(f"  超参: n_estimators=300, max_depth=3, lr=0.05, subsample=0.8")
+        clf = GradientBoostingClassifier(
+            n_estimators=300, max_depth=3, learning_rate=0.05,
+            subsample=0.8, random_state=RANDOM_SEED,
         )
+        with Timer("Stage-1 训练", log):
+            clf.fit(X_tr_s, s_tr)
 
-        with Timer("[L4] 训练 ResidualCalibrator (50 trees, depth=3)", log):
-            residual_calib = ResidualCalibrator(n_estimators=50, max_depth=3,
-                                                learning_rate=0.05)
-            residual_calib.fit(
-                y_pred_raw=y_pred_va, y_true=y_va,
-                state_pred=state_pred_va,
-                timestamps=t_va, weather_df=weather_df,
-                recent_signal=recent_va, season_labels=sea_va,
-                logger=log,
+        # ---------- 5.1 [B] 阈值优化 (F_beta + 后处理) ----------
+        with Timer(f"[B] Stage-1 阈值搜索 (F{FBETA} + 后处理 min_on={POST_MIN_ON})", log):
+            p_va = clf.predict_proba(X_va_s)[:, 1]
+            result = search_best_threshold(
+                p_va, s_va, beta=FBETA,
+                min_on=POST_MIN_ON,
+                fill_short_off=POST_FILL_SHORT_OFF,
+            )
+            best_thr = result["best_thr"]
+            log.info(f"  最佳阈值 = {best_thr:.3f}   "
+                     f"Val F{FBETA} = {result['best_fbeta']:.4f}")
+
+        # 保存阈值-指标曲线
+        curve_df = pd.DataFrame(result["curve"])
+        curve_path = METRIC_DIR / "threshold_curve_val.csv"
+        curve_df.to_csv(curve_path, index=False, encoding="utf-8-sig")
+        log.info(f"  阈值曲线 -> {curve_path}  ({len(curve_df)} 行)")
+
+        # Train / Val 预测 (含后处理)
+        p_tr = clf.predict_proba(X_tr_s)[:, 1]
+        pred_state_raw_tr = (p_tr >= best_thr).astype(int)
+        pred_state_raw_va = (p_va >= best_thr).astype(int)
+        # 后处理
+        pred_state_tr, _ = apply_postprocess(pred_state_raw_tr,
+                                             np.zeros_like(pred_state_raw_tr),
+                                             POST_MIN_ON, POST_FILL_SHORT_OFF)
+        pred_state_va, _ = apply_postprocess(pred_state_raw_va,
+                                             np.zeros_like(pred_state_raw_va),
+                                             POST_MIN_ON, POST_FILL_SHORT_OFF)
+        log.info(f"  Train: raw_ON={pred_state_raw_tr.sum()}, "
+                 f"postproc_ON={pred_state_tr.sum()}, "
+                 f"真实_ON={s_tr.sum()}")
+        log.info(f"  Val  : raw_ON={pred_state_raw_va.sum()}, "
+                 f"postproc_ON={pred_state_va.sum()}, "
+                 f"真实_ON={s_va.sum()}")
+
+        # v6.12.6 单口径分类指标 (用训练标签 ON_THR_W=10W 评估)
+        cls_tr = compute_classification_metrics(s_tr, pred_state_tr, p_tr)
+        cls_va = compute_classification_metrics(s_va, pred_state_va, p_va)
+        log.info(f"  Train cls: {cls_tr}")
+        log.info(f"  Val   cls: {cls_va}")
+
+        # ---------- 6. Stage-2 季节分层 MoE 条件功率回归 (v4) ----------
+        log.info("-" * 70)
+        log.info("[Stage-2] 训练 季节分层 MoE 条件功率回归器")
+        mask_on = s_tr == 1
+        n_on = int(mask_on.sum())
+        log.info(f"  ON 训练样本数: {n_on}")
+
+        # 训练前: 季节分布诊断 (v5 用温度驱动的 season 标签)
+        log.info("  ---- 季节分布诊断 (Train ON 样本) ----")
+        diag = diagnose_seasonal_distribution(sea_tr, y_tr, s_tr, logger=log)
+
+        # [1] 样本权重 (整个 train 集计算, 后续按 mask 取子集)
+        sw_full = None
+        if USE_SAMPLE_WEIGHT and n_on > 0:
+            with Timer("[1] 计算逆密度样本权重 (全局)", log):
+                sw_on = compute_inverse_density_weights(
+                    y_tr[mask_on], n_bins=WEIGHT_N_BINS,
+                )
+                # 扩展回全 train 长度 (OFF 样本权重 0, 但本来就不参与回归训练)
+                sw_full = np.zeros_like(y_tr, dtype=float)
+                sw_full[mask_on] = sw_on
+                stats = summarize_weights(y_tr[mask_on], sw_on, n_bins=5)
+                log.info(f"  权重 范围 [{stats['weight_min']:.3f}, "
+                         f"{stats['weight_max']:.3f}], "
+                         f"mean={stats['weight_mean']:.3f}")
+
+        # [2] GBR 工厂函数
+        def make_quantile_reg(alpha):
+            return GradientBoostingRegressor(
+                n_estimators=400, max_depth=3, learning_rate=0.05,
+                subsample=0.8, random_state=RANDOM_SEED,
+                loss="quantile", alpha=alpha,
             )
 
-        # 验证: val 集校正前后 MAE 对比
-        y_tr_calib = y_pred_tr.copy()   # 默认无变化
-        y_va_calib = y_pred_va.copy()
-        if residual_calib._trained:
-            # train 也需要近期信号 (与 val 同口径)
-            recent_tr = recent_24h[idx_tr]
-            state_pred_tr_filt, _ = apply_postprocess(
-                pred_state_raw_tr, np.zeros_like(pred_state_raw_tr),
+        # [A] 季节分层 MoE
+        log.info("  ---- 训练季节专家 ----")
+        moe = SeasonalRegressorBundle(
+            gbr_factory=make_quantile_reg,
+            quantiles=(QUANTILE_LOW, QUANTILE_ALPHA, QUANTILE_HIGH),
+            logger=log,
+        )
+        with Timer("[A] 季节分层 MoE 训练 (3 expert × 3 quantile + 3 fallback)", log):
+            # v5: 用 sea_tr (温度路由) 取代原来的 t_tr (月份路由)
+            moe.fit(X_tr_s, y_tr, s_tr, sea_tr, sample_weight=sw_full)
+
+        # 兼容旧 bundle 的别名 (供下游脚本无缝读取)
+        reg      = moe   # 注意: 这里 reg 已是 MoE 对象, 推理时需传 timestamps
+        # 保留单一 fallback 全局 GBR (向下兼容老推理脚本)
+        reg_global_p50  = moe.fallback[QUANTILE_ALPHA]
+        reg_global_low  = moe.fallback[QUANTILE_LOW]
+        reg_global_high = moe.fallback[QUANTILE_HIGH]
+
+        def predict_combined_moe(X_s, p_state, season_labels):
+            raw_state = (p_state >= best_thr).astype(int)
+            p_med  = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_ALPHA), 0, None)
+            p_low  = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_LOW),  0, None)
+            p_high = np.clip(moe.predict(X_s, season_labels, alpha=QUANTILE_HIGH), 0, None)
+            state_filt, y_pred_filt = apply_postprocess(
+                raw_state, p_med, POST_MIN_ON, POST_FILL_SHORT_OFF,
+            )
+            return y_pred_filt, state_filt, p_med, p_low, p_high
+
+        y_pred_tr, _, p_med_tr, p_low_tr, p_high_tr = \
+            predict_combined_moe(X_tr_s, p_tr, sea_tr)
+        y_pred_va, _, p_med_va, p_low_va, p_high_va = \
+            predict_combined_moe(X_va_s, p_va, sea_va)
+
+        reg_tr = compute_regression_metrics(y_tr, y_pred_tr)
+        reg_va = compute_regression_metrics(y_va, y_pred_va)
+        log.info(f"  Train reg: {reg_tr}")
+        log.info(f"  Val   reg: {reg_va}")
+
+        # 残差诊断 (按季节细分, 关键!)
+        def log_residual_bias_by_season(y_true, y_pred, s_true, sea, tag):
+            m = s_true == 1
+            if m.sum() == 0:
+                return
+            res_all = y_pred[m] - y_true[m]
+            log.info(f"  [{tag}] ON 整体  残差: 中位={np.median(res_all):+.1f}W "
+                     f"均值={res_all.mean():+.1f}W std={res_all.std():.1f}W "
+                     f"(n={int(m.sum())})")
+            for season in SEASON_LABELS:
+                mm = m & (sea == season)
+                if mm.sum() == 0:
+                    continue
+                r = y_pred[mm] - y_true[mm]
+                log.info(f"      + {season:<11} 残差: 中位={np.median(r):+.1f}W "
+                         f"均值={r.mean():+.1f}W std={r.std():.1f}W "
+                         f"(n={int(mm.sum())})")
+
+        log_residual_bias_by_season(y_tr, y_pred_tr, s_tr, sea_tr, "Train")
+        log_residual_bias_by_season(y_va, y_pred_va, s_va, sea_va, "Val  ")
+
+        # ---------- 7. [L4] 训练残差校正层 (在 val 集上学) ----------
+        residual_calib = None
+        if USE_RESIDUAL_CALIB:
+            log.info("-" * 70)
+            log.info("[L4] 残差校正层训练 (在 val 集上学习, 不污染主模型)")
+
+            # 计算 val 集的 recent_signal (Top-1 列近 24h 滚动均值)
+            if top_cols and top_cols[0] in df.columns:
+                top1 = df[top_cols[0]].astype(float)
+                recent_24h = top1.rolling(window=96, min_periods=4,
+                                          closed="left").mean().bfill().values
+            else:
+                recent_24h = np.zeros(len(df))
+
+            recent_va = recent_24h[idx_va]
+            # val 的 state_pred (用主模型推理结果)
+            state_pred_va, _ = apply_postprocess(
+                pred_state_raw_va, np.zeros_like(pred_state_raw_va),
                 POST_MIN_ON, POST_FILL_SHORT_OFF,
             )
-            y_tr_calib = residual_calib.apply(
-                y_pred_tr, t_tr, weather_df, recent_tr, sea_tr,
-                state_pred=state_pred_tr_filt,
-            )
-            y_va_calib = residual_calib.apply(
-                y_pred_va, t_va, weather_df, recent_va, sea_va,
-                state_pred=state_pred_va,
-            )
-            mae_before = np.abs(y_pred_va - y_va).mean()
-            mae_after  = np.abs(y_va_calib - y_va).mean()
-            log.info(f"  [L4] Val MAE: 校正前 {mae_before:.2f}W -> "
-                     f"校正后 {mae_after:.2f}W  (变化 {mae_after-mae_before:+.2f}W)")
 
-    # ---------- 6c. [新增] Fallback 全局回归器指标计算 ----------
-    # MoE 内的 fallback 是无季节路由的全局 GBR, 作为对照基线
-    log.info("-" * 70)
-    log.info("[Fallback 全局回归器] 计算指标 (无季节路由对照)")
-    p_fb_tr = np.clip(reg_global_p50.predict(X_tr_s), 0, None)
-    p_fb_va = np.clip(reg_global_p50.predict(X_va_s), 0, None)
-    state_pred_tr_filt_fb, y_pred_fb_tr = apply_postprocess(
-        pred_state_raw_tr, p_fb_tr, POST_MIN_ON, POST_FILL_SHORT_OFF,
-    )
-    state_pred_va_filt_fb, y_pred_fb_va = apply_postprocess(
-        pred_state_raw_va, p_fb_va, POST_MIN_ON, POST_FILL_SHORT_OFF,
-    )
-    cls_fb_tr = compute_classification_metrics(s_tr, state_pred_tr_filt_fb, p_tr)
-    cls_fb_va = compute_classification_metrics(s_va, state_pred_va_filt_fb, p_va)
-    reg_fb_tr = compute_regression_metrics(y_tr, y_pred_fb_tr)
-    reg_fb_va = compute_regression_metrics(y_va, y_pred_fb_va)
-    log.info(f"  Train cls: F1={cls_fb_tr['F1']:.4f}, "
-             f"reg: MAE={reg_fb_tr['MAE_W']:.2f}W SAE={reg_fb_tr['SAE']*100:.2f}%")
-    log.info(f"  Val   cls: F1={cls_fb_va['F1']:.4f}, "
-             f"reg: MAE={reg_fb_va['MAE_W']:.2f}W SAE={reg_fb_va['SAE']*100:.2f}%")
+            with Timer("[L4] 训练 ResidualCalibrator (50 trees, depth=3)", log):
+                residual_calib = ResidualCalibrator(n_estimators=50, max_depth=3,
+                                                    learning_rate=0.05)
+                residual_calib.fit(
+                    y_pred_raw=y_pred_va, y_true=y_va,
+                    state_pred=state_pred_va,
+                    timestamps=t_va, weather_df=weather_df,
+                    recent_signal=recent_va, season_labels=sea_va,
+                    logger=log,
+                )
 
-    # ---------- 6d. [新增] L4 校正后主模型指标 ----------
-    cls_calib_tr = cls_calib_va = None
-    reg_calib_tr = reg_calib_va = None
-    if residual_calib is not None and residual_calib._trained:
+            # 验证: val 集校正前后 MAE 对比
+            y_tr_calib = y_pred_tr.copy()   # 默认无变化
+            y_va_calib = y_pred_va.copy()
+            if residual_calib._trained:
+                # train 也需要近期信号 (与 val 同口径)
+                recent_tr = recent_24h[idx_tr]
+                state_pred_tr_filt, _ = apply_postprocess(
+                    pred_state_raw_tr, np.zeros_like(pred_state_raw_tr),
+                    POST_MIN_ON, POST_FILL_SHORT_OFF,
+                )
+                y_tr_calib = residual_calib.apply(
+                    y_pred_tr, t_tr, weather_df, recent_tr, sea_tr,
+                    state_pred=state_pred_tr_filt,
+                )
+                y_va_calib = residual_calib.apply(
+                    y_pred_va, t_va, weather_df, recent_va, sea_va,
+                    state_pred=state_pred_va,
+                )
+                mae_before = np.abs(y_pred_va - y_va).mean()
+                mae_after  = np.abs(y_va_calib - y_va).mean()
+                log.info(f"  [L4] Val MAE: 校正前 {mae_before:.2f}W -> "
+                         f"校正后 {mae_after:.2f}W  (变化 {mae_after-mae_before:+.2f}W)")
+
+        # ---------- 6c. [新增] Fallback 全局回归器指标计算 ----------
+        # MoE 内的 fallback 是无季节路由的全局 GBR, 作为对照基线
         log.info("-" * 70)
-        log.info("[main_L4_calib] 计算 L4 校正后主模型指标")
-        # 分类指标与主模型一致 (L4 只校正功率, 不改变状态)
-        cls_calib_tr = cls_tr.copy()
-        cls_calib_va = cls_va.copy()
-        reg_calib_tr = compute_regression_metrics(y_tr, y_tr_calib)
-        reg_calib_va = compute_regression_metrics(y_va, y_va_calib)
-        log.info(f"  Train reg (校正后): MAE={reg_calib_tr['MAE_W']:.2f}W "
-                 f"SAE={reg_calib_tr['SAE']*100:.2f}%")
-        log.info(f"  Val   reg (校正后): MAE={reg_calib_va['MAE_W']:.2f}W "
-                 f"SAE={reg_calib_va['SAE']*100:.2f}%")
+        log.info("[Fallback 全局回归器] 计算指标 (无季节路由对照)")
+        p_fb_tr = np.clip(reg_global_p50.predict(X_tr_s), 0, None)
+        p_fb_va = np.clip(reg_global_p50.predict(X_va_s), 0, None)
+        state_pred_tr_filt_fb, y_pred_fb_tr = apply_postprocess(
+            pred_state_raw_tr, p_fb_tr, POST_MIN_ON, POST_FILL_SHORT_OFF,
+        )
+        state_pred_va_filt_fb, y_pred_fb_va = apply_postprocess(
+            pred_state_raw_va, p_fb_va, POST_MIN_ON, POST_FILL_SHORT_OFF,
+        )
+        cls_fb_tr = compute_classification_metrics(s_tr, state_pred_tr_filt_fb, p_tr)
+        cls_fb_va = compute_classification_metrics(s_va, state_pred_va_filt_fb, p_va)
+        reg_fb_tr = compute_regression_metrics(y_tr, y_pred_fb_tr)
+        reg_fb_va = compute_regression_metrics(y_va, y_pred_fb_va)
+        log.info(f"  Train cls: F1={cls_fb_tr['F1']:.4f}, "
+                 f"reg: MAE={reg_fb_tr['MAE_W']:.2f}W SAE={reg_fb_tr['SAE']*100:.2f}%")
+        log.info(f"  Val   cls: F1={cls_fb_va['F1']:.4f}, "
+                 f"reg: MAE={reg_fb_va['MAE_W']:.2f}W SAE={reg_fb_va['SAE']*100:.2f}%")
 
-    # 保存 expert 训练摘要
-    expert_summary_df = pd.DataFrame(moe.expert_summary())
-    es_path = METRIC_DIR / "expert_summary.csv"
-    expert_summary_df.to_csv(es_path, index=False, encoding="utf-8-sig")
-    log.info(f"  ✓ expert 训练摘要 -> {es_path}")
+        # ---------- 6d. [新增] L4 校正后主模型指标 ----------
+        cls_calib_tr = cls_calib_va = None
+        reg_calib_tr = reg_calib_va = None
+        if residual_calib is not None and residual_calib._trained:
+            log.info("-" * 70)
+            log.info("[main_L4_calib] 计算 L4 校正后主模型指标")
+            # 分类指标与主模型一致 (L4 只校正功率, 不改变状态)
+            cls_calib_tr = cls_tr.copy()
+            cls_calib_va = cls_va.copy()
+            reg_calib_tr = compute_regression_metrics(y_tr, y_tr_calib)
+            reg_calib_va = compute_regression_metrics(y_va, y_va_calib)
+            log.info(f"  Train reg (校正后): MAE={reg_calib_tr['MAE_W']:.2f}W "
+                     f"SAE={reg_calib_tr['SAE']*100:.2f}%")
+            log.info(f"  Val   reg (校正后): MAE={reg_calib_va['MAE_W']:.2f}W "
+                     f"SAE={reg_calib_va['SAE']*100:.2f}%")
 
-    # ---------- 7. 基线: 单阶段 RF ----------
-    log.info("-" * 70)
-    log.info("[Baseline] 训练 RandomForestRegressor (单阶段)")
-    rf = RandomForestRegressor(n_estimators=300, max_depth=8,
-                               random_state=RANDOM_SEED, n_jobs=-1)
-    with Timer("RF 训练", log):
-        rf.fit(X_tr_s, y_tr)
-    y_rf_tr = np.clip(rf.predict(X_tr_s), 0, None)
-    y_rf_va = np.clip(rf.predict(X_va_s), 0, None)
-    # v6.12.6 RF baseline 用统一 ON_THR_W=10W (与训练标签同口径)
-    s_rf_tr = (y_rf_tr >= ON_THR_W).astype(int)
-    s_rf_va = (y_rf_va >= ON_THR_W).astype(int)
-    cls_rf_tr = compute_classification_metrics(s_tr, s_rf_tr, y_rf_tr)
-    cls_rf_va = compute_classification_metrics(s_va, s_rf_va, y_rf_va)
-    reg_rf_tr = compute_regression_metrics(y_tr, y_rf_tr)
-    reg_rf_va = compute_regression_metrics(y_va, y_rf_va)
-    log.info(f"  RF Train: cls F1={cls_rf_tr['F1']:.4f}, reg {reg_rf_tr}")
-    log.info(f"  RF Val  : cls F1={cls_rf_va['F1']:.4f}, reg {reg_rf_va}")
+        # 保存 expert 训练摘要
+        expert_summary_df = pd.DataFrame(moe.expert_summary())
+        es_path = METRIC_DIR / "expert_summary.csv"
+        expert_summary_df.to_csv(es_path, index=False, encoding="utf-8-sig")
+        log.info(f"  ✓ expert 训练摘要 -> {es_path}")
 
+    else:
+        # [v15] rf-only 占位: 补齐下游共享变量默认值 (RF 训练/自包含 bundle 不需要主模型对象)
+        best_thr = 0.5
+        p_tr = p_va = None
+        pred_state_tr = pred_state_va = None
+        cls_tr = cls_va = None
+        moe = None
+        reg = None
+        reg_global_p50 = reg_global_low = reg_global_high = None
+        y_pred_tr = y_pred_va = None
+        p_med_tr = p_med_va = p_low_tr = p_low_va = p_high_tr = p_high_va = None
+        reg_tr = reg_va = None
+        residual_calib = None
+        y_tr_calib = y_va_calib = None
+        cls_fb_tr = cls_fb_va = None
+        reg_fb_tr = reg_fb_va = None
+        cls_calib_tr = cls_calib_va = None
+        reg_calib_tr = reg_calib_va = None
+    # [v15 算法解耦] 仅当本次需要训练 RF 基线时执行; main-only 时跳过
+    if _do_rf:
+        # ---------- 7. 基线: 单阶段 RF ----------
+        log.info("-" * 70)
+        log.info("[Baseline] 训练 RandomForestRegressor (单阶段)")
+        rf = RandomForestRegressor(n_estimators=300, max_depth=8,
+                                   random_state=RANDOM_SEED, n_jobs=-1)
+        with Timer("RF 训练", log):
+            rf.fit(X_tr_s, y_tr)
+        y_rf_tr = np.clip(rf.predict(X_tr_s), 0, None)
+        y_rf_va = np.clip(rf.predict(X_va_s), 0, None)
+        # v6.12.6 RF baseline 用统一 ON_THR_W=10W (与训练标签同口径)
+        s_rf_tr = (y_rf_tr >= ON_THR_W).astype(int)
+        s_rf_va = (y_rf_va >= ON_THR_W).astype(int)
+        cls_rf_tr = compute_classification_metrics(s_tr, s_rf_tr, y_rf_tr)
+        cls_rf_va = compute_classification_metrics(s_va, s_rf_va, y_rf_va)
+        reg_rf_tr = compute_regression_metrics(y_tr, y_rf_tr)
+        reg_rf_va = compute_regression_metrics(y_va, y_rf_va)
+        log.info(f"  RF Train: cls F1={cls_rf_tr['F1']:.4f}, reg {reg_rf_tr}")
+        log.info(f"  RF Val  : cls F1={cls_rf_va['F1']:.4f}, reg {reg_rf_va}")
+
+    else:
+        # [v15] main-only 占位: RF 相关变量置空 (bundle 中 "rf" 键为 None)
+        rf = None
+        y_rf_tr = y_rf_va = None
+        s_rf_tr = s_rf_va = None
+        cls_rf_tr = cls_rf_va = None
+        reg_rf_tr = reg_rf_va = None
     # ---------- 8. 保存模型 ----------
     log.info("-" * 70)
     log.info("保存模型")
     ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # ---------- v6.12.1: 计算 d87 启动签名守卫的自适应阈值元数据 ----------
-    # 目的: 让推理侧 d87 守卫不再依赖硬编码阈值 100, 而是从训练集统计学习
-    # 物理依据:
-    #   启动 d87 = 单步负向尖峰 (842: -150~-224, 270848: -65~-106)
-    #   OFF 段 d87 = 噪声范围 (P1=-32, P50=-16) - 不分用户
-    #   合理阈值 = train_off_P1 (-32) * 安全系数 2 = -64
-    # 推理时: 一日 (或一窗口) 内 d87.min() < 阈值 -> 认为有空调启动迹象, 放行
-    d87_guard_meta = {"enabled": False}
-    try:
-        # [v13] 用户级守卫决策 (优先级最高) - 从环境变量读 (由 run_user_pipeline.py 注入):
-        #   NILM_USER_GUARD_ENABLED = "1" / "0" / "" (空表示未指定)
-        #   若显式指定, 覆盖 common.D87_ADAPTIVE_GUARD_ENABLED 全局开关
-        _env_guard = _os.environ.get("NILM_USER_GUARD_ENABLED", "").strip()
-        if _env_guard == "0":
-            d87_guard_meta["disabled_by_switch"] = True
-            d87_guard_meta["disabled_by_user_config"] = True
-            log.info("  [v13] NILM_USER_GUARD_ENABLED=0 (用户级配置显式关闭), 跳过 d87 元数据")
-            log.info("        (bundle['d87_guard_meta']['enabled']=False, 推理侧将不做步级压制)")
-            raise _SkipD87Guard()
-        elif _env_guard == "1":
-            log.info("  [v13] NILM_USER_GUARD_ENABLED=1 (用户级配置显式开启), 覆盖全局开关继续计算 d87 元数据")
-            # 继续正常流程 (不跳过)
-        else:
-            # 未指定用户级配置, 回退到全局开关 [v11] 语义
-            if not D87_ADAPTIVE_GUARD_ENABLED:
+    # [v15 算法解耦] d87 守卫为主模型专属机制, 仅主模型训练时计算
+    if _do_main_flag:
+        # ---------- v6.12.1: 计算 d87 启动签名守卫的自适应阈值元数据 ----------
+        # 目的: 让推理侧 d87 守卫不再依赖硬编码阈值 100, 而是从训练集统计学习
+        # 物理依据:
+        #   启动 d87 = 单步负向尖峰 (842: -150~-224, 270848: -65~-106)
+        #   OFF 段 d87 = 噪声范围 (P1=-32, P50=-16) - 不分用户
+        #   合理阈值 = train_off_P1 (-32) * 安全系数 2 = -64
+        # 推理时: 一日 (或一窗口) 内 d87.min() < 阈值 -> 认为有空调启动迹象, 放行
+        d87_guard_meta = {"enabled": False}
+        try:
+            # [v13] 用户级守卫决策 (优先级最高) - 从环境变量读 (由 run_user_pipeline.py 注入):
+            #   NILM_USER_GUARD_ENABLED = "1" / "0" / "" (空表示未指定)
+            #   若显式指定, 覆盖 common.D87_ADAPTIVE_GUARD_ENABLED 全局开关
+            _env_guard = _os.environ.get("NILM_USER_GUARD_ENABLED", "").strip()
+            if _env_guard == "0":
                 d87_guard_meta["disabled_by_switch"] = True
-                log.info("  [v11] D87_ADAPTIVE_GUARD_ENABLED=False (全局开关关闭), 跳过 d87 自适应守卫元数据计算")
+                d87_guard_meta["disabled_by_user_config"] = True
+                log.info("  [v13] NILM_USER_GUARD_ENABLED=0 (用户级配置显式关闭), 跳过 d87 元数据")
                 log.info("        (bundle['d87_guard_meta']['enabled']=False, 推理侧将不做步级压制)")
                 raise _SkipD87Guard()
-        log.info("  [v6.12.1] 计算 d87 守卫自适应阈值元数据 ...")
-        # 重新加载 5min 原始 bus 与 branch (训练时只有 15min 对齐数据)
-        from feature_utils import load_bus_csv, load_branch_csv
-        _bus_raw, _ = load_bus_csv(BUS_CSV)
-        _br_raw     = load_branch_csv(BR_CSV)
-        _bus_raw["ts"] = pd.to_datetime(_bus_raw["event_time"])
-        _bus_raw = _bus_raw.set_index("ts").sort_index()
-        _br_raw["ts"]  = pd.to_datetime(_br_raw["time"])
-        _br_raw = _br_raw.set_index("ts").sort_index()
+            elif _env_guard == "1":
+                log.info("  [v13] NILM_USER_GUARD_ENABLED=1 (用户级配置显式开启), 覆盖全局开关继续计算 d87 元数据")
+                # 继续正常流程 (不跳过)
+            else:
+                # 未指定用户级配置, 回退到全局开关 [v11] 语义
+                if not D87_ADAPTIVE_GUARD_ENABLED:
+                    d87_guard_meta["disabled_by_switch"] = True
+                    log.info("  [v11] D87_ADAPTIVE_GUARD_ENABLED=False (全局开关关闭), 跳过 d87 自适应守卫元数据计算")
+                    log.info("        (bundle['d87_guard_meta']['enabled']=False, 推理侧将不做步级压制)")
+                    raise _SkipD87Guard()
+            log.info("  [v6.12.1] 计算 d87 守卫自适应阈值元数据 ...")
+            # 重新加载 5min 原始 bus 与 branch (训练时只有 15min 对齐数据)
+            from feature_utils import load_bus_csv, load_branch_csv
+            _bus_raw, _ = load_bus_csv(BUS_CSV)
+            _br_raw     = load_branch_csv(BR_CSV)
+            _bus_raw["ts"] = pd.to_datetime(_bus_raw["event_time"])
+            _bus_raw = _bus_raw.set_index("ts").sort_index()
+            _br_raw["ts"]  = pd.to_datetime(_br_raw["time"])
+            _br_raw = _br_raw.set_index("ts").sort_index()
 
-        if "load_iden_data87" not in _bus_raw.columns:
-            log.warning("  [v6.12.1] 训练 bus 缺 load_iden_data87, 跳过 d87 元数据")
-        else:
-            # v6.12.6: 守卫标定用业务功率阈值 (50W) 定义启动事件
-            # 物理依据: 待机负荷 (路由器/常开设备) 功率 <50W, 真实空调启动一定 >50W
-            # 用 50W 排除常态小负荷, 让 train_on_p10_abs 更纯净, 守卫阈值标定更准
-            # 注: 这里 50W 是守卫局部硬编码, 不影响模型训练标签 (ON_THR_W=10W) 和指标评估
-            _D87_CALIB_ON_THR_W = 50.0
-            _br_raw["on"] = (_br_raw[TARGET_COL] > _D87_CALIB_ON_THR_W).astype(int)
-            off_d87_min = []
-            for i in range(0, len(_br_raw) - 4):
-                if (_br_raw[TARGET_COL].iloc[i:i+4] < 10).all():
-                    ts = _br_raw.index[i+2]
-                    win = _bus_raw.loc[ts-pd.Timedelta("15min"):ts+pd.Timedelta("15min")]
+            if "load_iden_data87" not in _bus_raw.columns:
+                log.warning("  [v6.12.1] 训练 bus 缺 load_iden_data87, 跳过 d87 元数据")
+            else:
+                # v6.12.6: 守卫标定用业务功率阈值 (50W) 定义启动事件
+                # 物理依据: 待机负荷 (路由器/常开设备) 功率 <50W, 真实空调启动一定 >50W
+                # 用 50W 排除常态小负荷, 让 train_on_p10_abs 更纯净, 守卫阈值标定更准
+                # 注: 这里 50W 是守卫局部硬编码, 不影响模型训练标签 (ON_THR_W=10W) 和指标评估
+                _D87_CALIB_ON_THR_W = 50.0
+                _br_raw["on"] = (_br_raw[TARGET_COL] > _D87_CALIB_ON_THR_W).astype(int)
+                off_d87_min = []
+                for i in range(0, len(_br_raw) - 4):
+                    if (_br_raw[TARGET_COL].iloc[i:i+4] < 10).all():
+                        ts = _br_raw.index[i+2]
+                        win = _bus_raw.loc[ts-pd.Timedelta("15min"):ts+pd.Timedelta("15min")]
+                        if len(win) > 0:
+                            off_d87_min.append(float(win["load_iden_data87"].min()))
+                off_arr = np.array(off_d87_min) if off_d87_min else np.array([0.0])
+
+                # 同时记录 ON 启动事件 d87.min, 仅用于诊断
+                _br_raw["prev_on"] = _br_raw["on"].shift(1).fillna(0).astype(int)
+                on_events_idx = _br_raw[(_br_raw["on"]==1)&(_br_raw["prev_on"]==0)].index
+                on_d87_min = []
+                for ts in on_events_idx:
+                    win = _bus_raw.loc[ts-pd.Timedelta("20min"):ts+pd.Timedelta("10min")]
                     if len(win) > 0:
-                        off_d87_min.append(float(win["load_iden_data87"].min()))
-            off_arr = np.array(off_d87_min) if off_d87_min else np.array([0.0])
+                        on_d87_min.append(float(win["load_iden_data87"].min()))
+                on_arr = np.array(on_d87_min) if on_d87_min else np.array([0.0])
 
-            # 同时记录 ON 启动事件 d87.min, 仅用于诊断
-            _br_raw["prev_on"] = _br_raw["on"].shift(1).fillna(0).astype(int)
-            on_events_idx = _br_raw[(_br_raw["on"]==1)&(_br_raw["prev_on"]==0)].index
-            on_d87_min = []
-            for ts in on_events_idx:
-                win = _bus_raw.loc[ts-pd.Timedelta("20min"):ts+pd.Timedelta("10min")]
-                if len(win) > 0:
-                    on_d87_min.append(float(win["load_iden_data87"].min()))
-            on_arr = np.array(on_d87_min) if on_d87_min else np.array([0.0])
+                # v6.12.4 关键统计 (用于阈值标定): 双向 |d87|.max (不分方向)
+                # 因为 v6.12.3 已验证 4% 启动是正向尖峰
+                off_d87_amax = []
+                for i in range(0, len(_br_raw) - 4):
+                    if (_br_raw[TARGET_COL].iloc[i:i+4] < 10).all():
+                        ts = _br_raw.index[i+2]
+                        win = _bus_raw.loc[ts-pd.Timedelta("15min"):ts+pd.Timedelta("15min")]
+                        if len(win) > 0:
+                            off_d87_amax.append(float(max(
+                                abs(win["load_iden_data87"].min()),
+                                abs(win["load_iden_data87"].max())
+                            )))
+                off_amax_arr = np.array(off_d87_amax) if off_d87_amax else np.array([0.0])
 
-            # v6.12.4 关键统计 (用于阈值标定): 双向 |d87|.max (不分方向)
-            # 因为 v6.12.3 已验证 4% 启动是正向尖峰
-            off_d87_amax = []
-            for i in range(0, len(_br_raw) - 4):
-                if (_br_raw[TARGET_COL].iloc[i:i+4] < 10).all():
-                    ts = _br_raw.index[i+2]
-                    win = _bus_raw.loc[ts-pd.Timedelta("15min"):ts+pd.Timedelta("15min")]
+                on_d87_amax = []
+                for ts in on_events_idx:
+                    win = _bus_raw.loc[ts-pd.Timedelta("20min"):ts+pd.Timedelta("10min")]
                     if len(win) > 0:
-                        off_d87_amax.append(float(max(
+                        on_d87_amax.append(float(max(
                             abs(win["load_iden_data87"].min()),
                             abs(win["load_iden_data87"].max())
                         )))
-            off_amax_arr = np.array(off_d87_amax) if off_d87_amax else np.array([0.0])
+                on_amax_arr = np.array(on_d87_amax) if on_d87_amax else np.array([0.0])
 
-            on_d87_amax = []
-            for ts in on_events_idx:
-                win = _bus_raw.loc[ts-pd.Timedelta("20min"):ts+pd.Timedelta("10min")]
-                if len(win) > 0:
-                    on_d87_amax.append(float(max(
-                        abs(win["load_iden_data87"].min()),
-                        abs(win["load_iden_data87"].max())
-                    )))
-            on_amax_arr = np.array(on_d87_amax) if on_d87_amax else np.array([0.0])
+                # ============================================================
+                # v6.12.4 阈值标定 (双源约束, 替代 v6.12.2 的单源 OFF×SF):
+                # ============================================================
+                #   ideal_thr = max(
+                #       ON 启动 P10 × ALLOW_FACTOR (0.8),  # 让 90% 启动通过
+                #       OFF 噪声 P99 × MARGIN_FACTOR (1.3),# 明显超过 OFF 噪声
+                #   )
+                # 设计动机:
+                #   v6.12.2/3 用 OFF_P1 × 3.0 作为阈值, 在用户 OFF 噪声大时 (如用户2
+                #   OFF_P1=-62, 阈值-186) 会推到比 ON 启动中位还严, 错压制启动事件 (5/27).
+                #   双源约束让阈值兼顾两类不可分点: 弱启动 与 强噪声.
+                # 物理依据 (89 个启动 + 4819 个 OFF 段验证):
+                #   用户1: ON P10=75, OFF P99=50 -> 阈值 max(60, 65) = 65
+                #   用户2: ON P10=129, OFF P99=69 -> 阈值 max(103, 90) = 103
+                #          (旧 v6.12.3 用户2 阈值是 -185, 错压制 5/27 |d87|=166)
+                # ============================================================
+                # v6.12.5: ALLOW_FACTOR 从 0.8 -> 0.9
+                # 实测 (用户2 OOD 14 天):
+                #   AF=0.8 (阈值 96): FP=2 (5/30+6/02 边界噪声), Precision=78%
+                #   AF=0.9 (阈值 109): FP=0, Precision=100%, Recall 仍 100%
+                # 阈值 109 正好穿过 5/27 的 |d87|=166 (放行) 与 5/30 的 104 (压制) 之间
+                # ============================================================
+                # v6.15.0 自适应守卫阈值 (替代 v6.14.2 硬编码 ALLOW/MARGIN)
+                # 设计三要素 (详见 common.py GUARD_* 配置):
+                #   (A) 软最大平滑   -- gap 接近时不再硬翻转 max
+                #   (B) 样本量自适应 -- n_on/n_off 越少, AF/MF 越保守
+                #   (C) 元数据导出   -- 让推理侧 (05_inference.py) 做概率融合
+                # ============================================================
+                from common import (
+                    GUARD_AF_MIN, GUARD_AF_MAX, GUARD_AF_N_REF,
+                    GUARD_MF_MIN, GUARD_MF_MAX, GUARD_MF_N_REF,
+                    GUARD_SOFTMAX_TEMP_W, GUARD_SOFTMAX_PIVOT_W,
+                    GUARD_PROB_FUSION_ENABLED, GUARD_PROB_GAMMA, GUARD_PROB_MIN_RATIO,
+                )
 
-            # ============================================================
-            # v6.12.4 阈值标定 (双源约束, 替代 v6.12.2 的单源 OFF×SF):
-            # ============================================================
-            #   ideal_thr = max(
-            #       ON 启动 P10 × ALLOW_FACTOR (0.8),  # 让 90% 启动通过
-            #       OFF 噪声 P99 × MARGIN_FACTOR (1.3),# 明显超过 OFF 噪声
-            #   )
-            # 设计动机:
-            #   v6.12.2/3 用 OFF_P1 × 3.0 作为阈值, 在用户 OFF 噪声大时 (如用户2
-            #   OFF_P1=-62, 阈值-186) 会推到比 ON 启动中位还严, 错压制启动事件 (5/27).
-            #   双源约束让阈值兼顾两类不可分点: 弱启动 与 强噪声.
-            # 物理依据 (89 个启动 + 4819 个 OFF 段验证):
-            #   用户1: ON P10=75, OFF P99=50 -> 阈值 max(60, 65) = 65
-            #   用户2: ON P10=129, OFF P99=69 -> 阈值 max(103, 90) = 103
-            #          (旧 v6.12.3 用户2 阈值是 -185, 错压制 5/27 |d87|=166)
-            # ============================================================
-            # v6.12.5: ALLOW_FACTOR 从 0.8 -> 0.9
-            # 实测 (用户2 OOD 14 天):
-            #   AF=0.8 (阈值 96): FP=2 (5/30+6/02 边界噪声), Precision=78%
-            #   AF=0.9 (阈值 109): FP=0, Precision=100%, Recall 仍 100%
-            # 阈值 109 正好穿过 5/27 的 |d87|=166 (放行) 与 5/30 的 104 (压制) 之间
-            # ============================================================
-            # v6.15.0 自适应守卫阈值 (替代 v6.14.2 硬编码 ALLOW/MARGIN)
-            # 设计三要素 (详见 common.py GUARD_* 配置):
-            #   (A) 软最大平滑   -- gap 接近时不再硬翻转 max
-            #   (B) 样本量自适应 -- n_on/n_off 越少, AF/MF 越保守
-            #   (C) 元数据导出   -- 让推理侧 (05_inference.py) 做概率融合
-            # ============================================================
-            from common import (
-                GUARD_AF_MIN, GUARD_AF_MAX, GUARD_AF_N_REF,
-                GUARD_MF_MIN, GUARD_MF_MAX, GUARD_MF_N_REF,
-                GUARD_SOFTMAX_TEMP_W, GUARD_SOFTMAX_PIVOT_W,
-                GUARD_PROB_FUSION_ENABLED, GUARD_PROB_GAMMA, GUARD_PROB_MIN_RATIO,
-            )
+                n_on_amax  = int(len(on_amax_arr))
+                n_off_amax = int(len(off_amax_arr))
 
-            n_on_amax  = int(len(on_amax_arr))
-            n_off_amax = int(len(off_amax_arr))
+                # --- (B) 样本量自适应 AF/MF ---
+                # 物理意义: 样本量越少, 分位数 (P10/P99) 越易被极值污染,
+                #          此时应取更保守的因子 (AF 更小=放行更多弱启动;
+                #          MF 更小=不让 P99 噪声主导阈值)
+                def _sqrt_interp(n, n_ref, vmin, vmax):
+                    ratio = max(0.0, min(1.0, n / max(1, n_ref)))
+                    return vmin + (vmax - vmin) * float(np.sqrt(ratio))
 
-            # --- (B) 样本量自适应 AF/MF ---
-            # 物理意义: 样本量越少, 分位数 (P10/P99) 越易被极值污染,
-            #          此时应取更保守的因子 (AF 更小=放行更多弱启动;
-            #          MF 更小=不让 P99 噪声主导阈值)
-            def _sqrt_interp(n, n_ref, vmin, vmax):
-                ratio = max(0.0, min(1.0, n / max(1, n_ref)))
-                return vmin + (vmax - vmin) * float(np.sqrt(ratio))
+                ALLOW_FACTOR  = _sqrt_interp(n_on_amax,  GUARD_AF_N_REF, GUARD_AF_MIN, GUARD_AF_MAX)
+                MARGIN_FACTOR = _sqrt_interp(n_off_amax, GUARD_MF_N_REF, GUARD_MF_MIN, GUARD_MF_MAX)
 
-            ALLOW_FACTOR  = _sqrt_interp(n_on_amax,  GUARD_AF_N_REF, GUARD_AF_MIN, GUARD_AF_MAX)
-            MARGIN_FACTOR = _sqrt_interp(n_off_amax, GUARD_MF_N_REF, GUARD_MF_MIN, GUARD_MF_MAX)
+                on_p10_abs  = float(np.quantile(on_amax_arr,  0.10))
+                off_p99_abs = float(np.quantile(off_amax_arr, 0.99)) if len(off_amax_arr) > 0 else 0.0
+                on_constraint  = on_p10_abs  * ALLOW_FACTOR
+                off_constraint = off_p99_abs * MARGIN_FACTOR
 
-            on_p10_abs  = float(np.quantile(on_amax_arr,  0.10))
-            off_p99_abs = float(np.quantile(off_amax_arr, 0.99)) if len(off_amax_arr) > 0 else 0.0
-            on_constraint  = on_p10_abs  * ALLOW_FACTOR
-            off_constraint = off_p99_abs * MARGIN_FACTOR
+                # --- (A) 软最大平滑 (替代硬 max) ---
+                # gap >> pivot -> weight≈1 -> 退化为 max (与旧行为一致, 安全)
+                # gap << pivot -> weight≈0.5 -> 取均值 (避免 1W 差距决定生死)
+                _gap = abs(on_constraint - off_constraint)
+                _w = 1.0 / (1.0 + float(np.exp(-(_gap - GUARD_SOFTMAX_PIVOT_W) / GUARD_SOFTMAX_TEMP_W)))
+                _hard_max = max(on_constraint, off_constraint)
+                _mean_two = (on_constraint + off_constraint) / 2.0
+                threshold_abs  = _w * _hard_max + (1.0 - _w) * _mean_two
+                threshold_base = -threshold_abs   # 保留符号 (向下兼容旧代码假设)
 
-            # --- (A) 软最大平滑 (替代硬 max) ---
-            # gap >> pivot -> weight≈1 -> 退化为 max (与旧行为一致, 安全)
-            # gap << pivot -> weight≈0.5 -> 取均值 (避免 1W 差距决定生死)
-            _gap = abs(on_constraint - off_constraint)
-            _w = 1.0 / (1.0 + float(np.exp(-(_gap - GUARD_SOFTMAX_PIVOT_W) / GUARD_SOFTMAX_TEMP_W)))
-            _hard_max = max(on_constraint, off_constraint)
-            _mean_two = (on_constraint + off_constraint) / 2.0
-            threshold_abs  = _w * _hard_max + (1.0 - _w) * _mean_two
-            threshold_base = -threshold_abs   # 保留符号 (向下兼容旧代码假设)
+                # 同时保留旧版统计 (兼容性 + 诊断)
+                train_off_p1 = float(np.quantile(off_arr, 0.01))
+                safety_factor_legacy = 3.0    # 仅记录, 不再用于决定 threshold
 
-            # 同时保留旧版统计 (兼容性 + 诊断)
-            train_off_p1 = float(np.quantile(off_arr, 0.01))
-            safety_factor_legacy = 3.0    # 仅记录, 不再用于决定 threshold
+                # 训练用户的 d73_p95 (作为缩放锚点, 推理时按比例缩放)
+                train_d73_p95 = float(_bus_raw["load_iden_data73"].quantile(0.95)) \
+                                if "load_iden_data73" in _bus_raw.columns else None
 
-            # 训练用户的 d73_p95 (作为缩放锚点, 推理时按比例缩放)
-            train_d73_p95 = float(_bus_raw["load_iden_data73"].quantile(0.95)) \
-                            if "load_iden_data73" in _bus_raw.columns else None
+                d87_guard_meta = {
+                    "enabled": True,
+                    "calibration": "v6.15.0_adaptive",       # v6.15: 自适应标定版本
+                    "threshold": threshold_base,             # 训练用户基准阈值
+                    "threshold_base": threshold_base,        # 同上
+                    "threshold_abs": threshold_abs,          # 绝对值阈值 (双向守卫直接用)
+                    # v6.12.4 双源约束 + v6.15 自适应
+                    "allow_factor": ALLOW_FACTOR,
+                    "margin_factor": MARGIN_FACTOR,
+                    "on_p10_abs": on_p10_abs,
+                    "off_p99_abs": off_p99_abs,
+                    "on_constraint": on_constraint,
+                    "off_constraint": off_constraint,
+                    "binding_constraint": ("ON" if on_constraint >= off_constraint else "OFF"),
+                    # v6.15 (A) 软最大平滑参数
+                    "softmax_weight": float(_w),             # 0~1, 1 为硬 max, 0.5 为均值
+                    "softmax_temp_w": float(GUARD_SOFTMAX_TEMP_W),
+                    "softmax_pivot_w": float(GUARD_SOFTMAX_PIVOT_W),
+                    # v6.15 (B) 样本量自适应参数
+                    "n_on_amax": n_on_amax,
+                    "n_off_amax": n_off_amax,
+                    "af_n_ref": GUARD_AF_N_REF,
+                    "mf_n_ref": GUARD_MF_N_REF,
+                    # v6.15 (C) 概率融合守卫 (推理侧使用)
+                    "prob_fusion_enabled": bool(GUARD_PROB_FUSION_ENABLED),
+                    "prob_gamma": float(GUARD_PROB_GAMMA),
+                    "prob_min_ratio": float(GUARD_PROB_MIN_RATIO),
+                    # v6.12.2 缩放支持
+                    "adaptive_scaling": True,
+                    "train_d73_p95": train_d73_p95,
+                    "scale_min": 0.05,
+                    "scale_max": 2.0,
+                    # v6.12.6 步级状态机守卫硬编码窗口 (12h, 典型空调一次运行 ≤ 12h)
+                    "max_on_hours": 12.0,
+                    # 历史字段 (兼容 + 诊断)
+                    "safety_factor": safety_factor_legacy,
+                    "train_off_n": int(len(off_arr)),
+                    "train_off_min": float(off_arr.min()),
+                    "train_off_p01": float(np.quantile(off_arr, 0.001)),
+                    "train_off_p1": train_off_p1,
+                    "train_off_p5": float(np.quantile(off_arr, 0.05)),
+                    "train_off_p50": float(np.quantile(off_arr, 0.50)),
+                    "train_off_amax_p99": off_p99_abs,
+                    "train_on_n": int(len(on_arr)),
+                    "train_on_p50": float(np.quantile(on_arr, 0.50)),
+                    "train_on_p90": float(np.quantile(on_arr, 0.90)),
+                    "train_on_amax_p10": on_p10_abs,
+                    "train_on_amax_p50": float(np.quantile(on_amax_arr, 0.50)),
+                }
+                log.info(f"  [v6.12.4] 训练集 OFF 段 |d87| (n={len(off_amax_arr)}): "
+                         f"P50={np.quantile(off_amax_arr,0.5):.0f}, "
+                         f"P95={np.quantile(off_amax_arr,0.95):.0f}, "
+                         f"P99={off_p99_abs:.0f}")
+                log.info(f"  [v6.12.4] 训练集 ON 启动 |d87| (n={len(on_amax_arr)}): "
+                         f"P10={on_p10_abs:.0f}, P50={np.quantile(on_amax_arr,0.5):.0f}, "
+                         f"P90={np.quantile(on_amax_arr,0.9):.0f}")
+                log.info(f"  [v6.15.0] 双源约束 + 自适应:")
+                log.info(f"  [v6.15.0]   样本量: n_on_amax={n_on_amax}, n_off_amax={n_off_amax}")
+                log.info(f"  [v6.15.0]   自适应 AF={ALLOW_FACTOR:.3f} (范围 [{GUARD_AF_MIN}, {GUARD_AF_MAX}], n_ref={GUARD_AF_N_REF})")
+                log.info(f"  [v6.15.0]   自适应 MF={MARGIN_FACTOR:.3f} (范围 [{GUARD_MF_MIN}, {GUARD_MF_MAX}], n_ref={GUARD_MF_N_REF})")
+                log.info(f"  [v6.15.0]   ON 约束:  on_P10({on_p10_abs:.0f}) × {ALLOW_FACTOR:.3f} = {on_constraint:.1f}")
+                log.info(f"  [v6.15.0]   OFF 约束: off_P99({off_p99_abs:.0f}) × {MARGIN_FACTOR:.3f} = {off_constraint:.1f}")
+                log.info(f"  [v6.15.0]   gap={_gap:.1f}W -> 软最大权重={_w:.3f} (1=hard max, 0.5=均值)")
+                log.info(f"  [v6.15.0]   绑定={d87_guard_meta['binding_constraint']} | "
+                         f"|阈值| = {_w:.2f}×{_hard_max:.1f} + {1-_w:.2f}×{_mean_two:.1f} = {threshold_abs:.1f}")
+                log.info(f"  [v6.15.0]   概率融合: enabled={GUARD_PROB_FUSION_ENABLED}, "
+                         f"gamma={GUARD_PROB_GAMMA}, min_ratio={GUARD_PROB_MIN_RATIO}")
+                log.info(f"  [v6.12.4] 训练用户 d73_p95 = {train_d73_p95:.0f}W (缩放锚点)")
+                log.info(f"  [v6.12.4]   含义: 推理时按 (user_d73_p95 / {train_d73_p95:.0f}) "
+                         f"× {threshold_abs:.0f} 自适应缩放")
+        except _SkipD87Guard:
+            # [v11] 开关关闭时的正常路径, 不打 warning
+            pass
+        except Exception as _e:
+            log.warning(f"  [v6.12.4] d87 元数据计算失败 ({_e}), 守卫将退化到硬编码模式")
 
-            d87_guard_meta = {
-                "enabled": True,
-                "calibration": "v6.15.0_adaptive",       # v6.15: 自适应标定版本
-                "threshold": threshold_base,             # 训练用户基准阈值
-                "threshold_base": threshold_base,        # 同上
-                "threshold_abs": threshold_abs,          # 绝对值阈值 (双向守卫直接用)
-                # v6.12.4 双源约束 + v6.15 自适应
-                "allow_factor": ALLOW_FACTOR,
-                "margin_factor": MARGIN_FACTOR,
-                "on_p10_abs": on_p10_abs,
-                "off_p99_abs": off_p99_abs,
-                "on_constraint": on_constraint,
-                "off_constraint": off_constraint,
-                "binding_constraint": ("ON" if on_constraint >= off_constraint else "OFF"),
-                # v6.15 (A) 软最大平滑参数
-                "softmax_weight": float(_w),             # 0~1, 1 为硬 max, 0.5 为均值
-                "softmax_temp_w": float(GUARD_SOFTMAX_TEMP_W),
-                "softmax_pivot_w": float(GUARD_SOFTMAX_PIVOT_W),
-                # v6.15 (B) 样本量自适应参数
-                "n_on_amax": n_on_amax,
-                "n_off_amax": n_off_amax,
-                "af_n_ref": GUARD_AF_N_REF,
-                "mf_n_ref": GUARD_MF_N_REF,
-                # v6.15 (C) 概率融合守卫 (推理侧使用)
-                "prob_fusion_enabled": bool(GUARD_PROB_FUSION_ENABLED),
-                "prob_gamma": float(GUARD_PROB_GAMMA),
-                "prob_min_ratio": float(GUARD_PROB_MIN_RATIO),
-                # v6.12.2 缩放支持
-                "adaptive_scaling": True,
-                "train_d73_p95": train_d73_p95,
-                "scale_min": 0.05,
-                "scale_max": 2.0,
-                # v6.12.6 步级状态机守卫硬编码窗口 (12h, 典型空调一次运行 ≤ 12h)
-                "max_on_hours": 12.0,
-                # 历史字段 (兼容 + 诊断)
-                "safety_factor": safety_factor_legacy,
-                "train_off_n": int(len(off_arr)),
-                "train_off_min": float(off_arr.min()),
-                "train_off_p01": float(np.quantile(off_arr, 0.001)),
-                "train_off_p1": train_off_p1,
-                "train_off_p5": float(np.quantile(off_arr, 0.05)),
-                "train_off_p50": float(np.quantile(off_arr, 0.50)),
-                "train_off_amax_p99": off_p99_abs,
-                "train_on_n": int(len(on_arr)),
-                "train_on_p50": float(np.quantile(on_arr, 0.50)),
-                "train_on_p90": float(np.quantile(on_arr, 0.90)),
-                "train_on_amax_p10": on_p10_abs,
-                "train_on_amax_p50": float(np.quantile(on_amax_arr, 0.50)),
-            }
-            log.info(f"  [v6.12.4] 训练集 OFF 段 |d87| (n={len(off_amax_arr)}): "
-                     f"P50={np.quantile(off_amax_arr,0.5):.0f}, "
-                     f"P95={np.quantile(off_amax_arr,0.95):.0f}, "
-                     f"P99={off_p99_abs:.0f}")
-            log.info(f"  [v6.12.4] 训练集 ON 启动 |d87| (n={len(on_amax_arr)}): "
-                     f"P10={on_p10_abs:.0f}, P50={np.quantile(on_amax_arr,0.5):.0f}, "
-                     f"P90={np.quantile(on_amax_arr,0.9):.0f}")
-            log.info(f"  [v6.15.0] 双源约束 + 自适应:")
-            log.info(f"  [v6.15.0]   样本量: n_on_amax={n_on_amax}, n_off_amax={n_off_amax}")
-            log.info(f"  [v6.15.0]   自适应 AF={ALLOW_FACTOR:.3f} (范围 [{GUARD_AF_MIN}, {GUARD_AF_MAX}], n_ref={GUARD_AF_N_REF})")
-            log.info(f"  [v6.15.0]   自适应 MF={MARGIN_FACTOR:.3f} (范围 [{GUARD_MF_MIN}, {GUARD_MF_MAX}], n_ref={GUARD_MF_N_REF})")
-            log.info(f"  [v6.15.0]   ON 约束:  on_P10({on_p10_abs:.0f}) × {ALLOW_FACTOR:.3f} = {on_constraint:.1f}")
-            log.info(f"  [v6.15.0]   OFF 约束: off_P99({off_p99_abs:.0f}) × {MARGIN_FACTOR:.3f} = {off_constraint:.1f}")
-            log.info(f"  [v6.15.0]   gap={_gap:.1f}W -> 软最大权重={_w:.3f} (1=hard max, 0.5=均值)")
-            log.info(f"  [v6.15.0]   绑定={d87_guard_meta['binding_constraint']} | "
-                     f"|阈值| = {_w:.2f}×{_hard_max:.1f} + {1-_w:.2f}×{_mean_two:.1f} = {threshold_abs:.1f}")
-            log.info(f"  [v6.15.0]   概率融合: enabled={GUARD_PROB_FUSION_ENABLED}, "
-                     f"gamma={GUARD_PROB_GAMMA}, min_ratio={GUARD_PROB_MIN_RATIO}")
-            log.info(f"  [v6.12.4] 训练用户 d73_p95 = {train_d73_p95:.0f}W (缩放锚点)")
-            log.info(f"  [v6.12.4]   含义: 推理时按 (user_d73_p95 / {train_d73_p95:.0f}) "
-                     f"× {threshold_abs:.0f} 自适应缩放")
-    except _SkipD87Guard:
-        # [v11] 开关关闭时的正常路径, 不打 warning
-        pass
-    except Exception as _e:
-        log.warning(f"  [v6.12.4] d87 元数据计算失败 ({_e}), 守卫将退化到硬编码模式")
+        # [v13] 兜底自动检测: 若用户配置未指定 guard_enabled 且守卫会导致严重误压,
+        # 自动降级关闭守卫 (避免像 270708 case 那样大量真 ON 被守卫强制置零)
+        #
+        # 触发条件: 环境变量 NILM_USER_GUARD_ENABLED 未指定 且 d87_guard_meta.enabled=True
+        #
+        # 判据 (任一满足即触发降级):
+        #   A. |d87|.max 绝对小 (< 50W)  -> 训练集 d87 特征本身弱
+        #   B. 阈值覆盖率不足 (推理时会大幅误压):
+        #      训练集 5min 原始 |d87| 中, 达到守卫阈值的天数占比 < 30%
+        #      (意味着推理时大部分天没有触发点, 会被状态机全天强制 OFF)
+        if (d87_guard_meta.get("enabled") is True and
+            _os.environ.get("NILM_USER_GUARD_ENABLED", "").strip() == ""):
 
-    # [v13] 兜底自动检测: 若用户配置未指定 guard_enabled 且守卫会导致严重误压,
-    # 自动降级关闭守卫 (避免像 270708 case 那样大量真 ON 被守卫强制置零)
-    #
-    # 触发条件: 环境变量 NILM_USER_GUARD_ENABLED 未指定 且 d87_guard_meta.enabled=True
-    #
-    # 判据 (任一满足即触发降级):
-    #   A. |d87|.max 绝对小 (< 50W)  -> 训练集 d87 特征本身弱
-    #   B. 阈值覆盖率不足 (推理时会大幅误压):
-    #      训练集 5min 原始 |d87| 中, 达到守卫阈值的天数占比 < 30%
-    #      (意味着推理时大部分天没有触发点, 会被状态机全天强制 OFF)
-    if (d87_guard_meta.get("enabled") is True and
-        _os.environ.get("NILM_USER_GUARD_ENABLED", "").strip() == ""):
+            _threshold_abs = d87_guard_meta.get("threshold_abs", 0)
+            _off_max = d87_guard_meta.get("train_off_amax_p99", 0)
+            _on_max  = d87_guard_meta.get("train_on_amax_p10", 0)
+            _d87_effective_max = max(_off_max, _on_max, _threshold_abs)
 
-        _threshold_abs = d87_guard_meta.get("threshold_abs", 0)
-        _off_max = d87_guard_meta.get("train_off_amax_p99", 0)
-        _on_max  = d87_guard_meta.get("train_on_amax_p10", 0)
-        _d87_effective_max = max(_off_max, _on_max, _threshold_abs)
+            # 判据 A: 绝对值太小
+            AUTO_DISABLE_THRESHOLD = 50.0
+            trigger_A = _d87_effective_max < AUTO_DISABLE_THRESHOLD
 
-        # 判据 A: 绝对值太小
-        AUTO_DISABLE_THRESHOLD = 50.0
-        trigger_A = _d87_effective_max < AUTO_DISABLE_THRESHOLD
+            # 判据 B: 阈值天覆盖率不足 (基于 5min 原始 bus 逐日统计)
+            # 用 _bus_raw 里的 d87 (前面已加载)
+            trigger_B = False
+            cover_ratio = None
+            _n_days_total = 0
+            _n_days_pass = 0
+            try:
+                # _bus_raw 在前面 d87 try 块里创建, 若守卫计算成功此变量存在
+                if "load_iden_data87" in _bus_raw.columns:
+                    _d87_series = _bus_raw["load_iden_data87"].dropna()
+                    _daily_max = _d87_series.abs().resample("D").max()
+                    _n_days_total = len(_daily_max)
+                    _n_days_pass  = int((_daily_max >= _threshold_abs).sum())
+                    cover_ratio = _n_days_pass / _n_days_total if _n_days_total > 0 else 0
+                    COVER_MIN = 0.30
+                    trigger_B = cover_ratio < COVER_MIN
+            except (NameError, Exception) as _e:
+                log.debug(f"  [v13 auto_detect] 判据 B 计算失败: {_e}")
 
-        # 判据 B: 阈值天覆盖率不足 (基于 5min 原始 bus 逐日统计)
-        # 用 _bus_raw 里的 d87 (前面已加载)
-        trigger_B = False
-        cover_ratio = None
-        _n_days_total = 0
-        _n_days_pass = 0
-        try:
-            # _bus_raw 在前面 d87 try 块里创建, 若守卫计算成功此变量存在
-            if "load_iden_data87" in _bus_raw.columns:
-                _d87_series = _bus_raw["load_iden_data87"].dropna()
-                _daily_max = _d87_series.abs().resample("D").max()
-                _n_days_total = len(_daily_max)
-                _n_days_pass  = int((_daily_max >= _threshold_abs).sum())
-                cover_ratio = _n_days_pass / _n_days_total if _n_days_total > 0 else 0
-                COVER_MIN = 0.30
-                trigger_B = cover_ratio < COVER_MIN
-        except (NameError, Exception) as _e:
-            log.debug(f"  [v13 auto_detect] 判据 B 计算失败: {_e}")
+            if trigger_A or trigger_B:
+                log.warning("=" * 70)
+                log.warning(f"  [v13 auto_detect_guard] 训练侧检测到 d87 守卫会严重误压推理:")
+                if trigger_A:
+                    log.warning(f"    判据 A: |d87|.max_effective={_d87_effective_max:.1f}W "
+                                f"< 阈值 {AUTO_DISABLE_THRESHOLD}W")
+                if trigger_B and cover_ratio is not None:
+                    log.warning(f"    判据 B: 训练集 {_n_days_total} 天中仅 {_n_days_pass} 天 "
+                                f"|d87|.max ≥ 守卫阈值 {_threshold_abs:.1f}W "
+                                f"(覆盖率 {cover_ratio*100:.1f}% < 30%)")
+                    log.warning(f"           -> 推理时约 {(1-cover_ratio)*100:.0f}% 的天会被守卫全天强制 OFF")
+                log.warning(f"  [v13 auto_detect_guard] 自动关闭 d87 守卫 (避免推理灾难)")
+                log.warning(f"  [v13 auto_detect_guard] 若需强制启用, "
+                            f"在 time_filters.json 中该用户配置 guard_enabled=true")
+                log.warning("=" * 70)
+                d87_guard_meta = {
+                    "enabled": False,
+                    "disabled_by_auto_detect": True,
+                    "auto_detect_d87_max": float(_d87_effective_max),
+                    "auto_detect_threshold_abs": float(_threshold_abs),
+                    "auto_detect_cover_ratio": float(cover_ratio) if cover_ratio is not None else None,
+                    "auto_detect_trigger": ("A" if trigger_A else "") + ("B" if trigger_B else ""),
+                }
 
-        if trigger_A or trigger_B:
-            log.warning("=" * 70)
-            log.warning(f"  [v13 auto_detect_guard] 训练侧检测到 d87 守卫会严重误压推理:")
-            if trigger_A:
-                log.warning(f"    判据 A: |d87|.max_effective={_d87_effective_max:.1f}W "
-                            f"< 阈值 {AUTO_DISABLE_THRESHOLD}W")
-            if trigger_B and cover_ratio is not None:
-                log.warning(f"    判据 B: 训练集 {_n_days_total} 天中仅 {_n_days_pass} 天 "
-                            f"|d87|.max ≥ 守卫阈值 {_threshold_abs:.1f}W "
-                            f"(覆盖率 {cover_ratio*100:.1f}% < 30%)")
-                log.warning(f"           -> 推理时约 {(1-cover_ratio)*100:.0f}% 的天会被守卫全天强制 OFF")
-            log.warning(f"  [v13 auto_detect_guard] 自动关闭 d87 守卫 (避免推理灾难)")
-            log.warning(f"  [v13 auto_detect_guard] 若需强制启用, "
-                        f"在 time_filters.json 中该用户配置 guard_enabled=true")
-            log.warning("=" * 70)
-            d87_guard_meta = {
-                "enabled": False,
-                "disabled_by_auto_detect": True,
-                "auto_detect_d87_max": float(_d87_effective_max),
-                "auto_detect_threshold_abs": float(_threshold_abs),
-                "auto_detect_cover_ratio": float(cover_ratio) if cover_ratio is not None else None,
-                "auto_detect_trigger": ("A" if trigger_A else "") + ("B" if trigger_B else ""),
-            }
-
+    else:
+        # [v15] rf-only: RF 基线无两阶段状态机, 禁用 d87 守卫元数据
+        d87_guard_meta = {"enabled": False}
     # 清除 MoE 中不可 pickle 的闭包函数 (gbr_factory) 和 logger
-    moe.strip_for_save()
+    if _do_main:
+        moe.strip_for_save()
     bundle = {
-        "scaler": scaler, "clf": clf, "rf": rf,
-        "moe": moe,
-        "reg":      reg_global_p50,
-        "reg_low":  reg_global_low,
-        "reg_high": reg_global_high,
+        "scaler": scaler,
+        "clf": (clf if _do_main else None),
+        "rf": (rf if _do_rf else None),
+        "moe": (moe if _do_main else None),
+        "reg":      (reg_global_p50 if _do_main else None),
+        "reg_low":  (reg_global_low if _do_main else None),
+        "reg_high": (reg_global_high if _do_main else None),
         "feat_cols": top_cols,
         "feat_names": feat_names,
         "best_thr": best_thr,
@@ -1034,8 +1103,10 @@ def main():
         "n_train": int(len(y_tr)), "n_val": int(len(y_va)),
         # 版本与超参 (v6.10: version 字段从 common.PROJECT_VERSION 统一读取)
         "version": (f"v42_baseline_{PROJECT_VERSION}"
-                    if _os.environ.get("NILM_BASELINE_MODE") == "1"
-                    else f"{PROJECT_VERSION}_weather_aware_drift_defense"),
+                    if _is_baseline_mode
+                    else (f"rf_baseline_{PROJECT_VERSION}"
+                          if (not _do_main and _do_rf)
+                          else f"{PROJECT_VERSION}_weather_aware_drift_defense")),
         "fbeta": FBETA,
         "post_min_on": POST_MIN_ON,
         "post_fill_short_off": POST_FILL_SHORT_OFF,
@@ -1045,7 +1116,7 @@ def main():
         "quantile_low":  QUANTILE_LOW,
         "quantile_high": QUANTILE_HIGH,
         "use_seasonal_moe": USE_SEASONAL_MOE,
-        "expert_summary": moe.expert_summary(),
+        "expert_summary": (moe.expert_summary() if _do_main else []),
         "split_strategy": SPLIT_STRATEGY,
         "split_ratios":   list(split_ratios),   # v6.5: 保存到 bundle, 推理时复用
         # [v13.8] 三集实际使用的日期集合 (ISO yyyy-mm-dd 字符串列表, 已排序去重).
@@ -1060,7 +1131,7 @@ def main():
         "use_drift_features":    USE_DRIFT_FEATURES,
         "temp_power_lut":        temp_power_lut,   # v6 L1: 用于推理重建漂移特征
         "use_residual_calib":    USE_RESIDUAL_CALIB,
-        "residual_calib":        residual_calib,   # v6 L4: 残差校正器
+        "residual_calib":        (residual_calib if _do_main else None),   # v6 L4: 残差校正器
         "use_temp_based_season": USE_TEMP_BASED_SEASON,
         "weather_latitude":      WEATHER_LATITUDE,
         "weather_longitude":     WEATHER_LONGITUDE,
@@ -1070,58 +1141,90 @@ def main():
         # v6.12.1: d87 守卫自适应阈值元数据
         "d87_guard_meta":        d87_guard_meta,
     }
-    joblib.dump(bundle, MODEL_PKL)
-    log.info(f"  ✓ 主模型 -> {MODEL_PKL}  ({MODEL_PKL.stat().st_size/1024:.1f} KB)")
+    if _do_main:
+        joblib.dump(bundle, MODEL_PKL)
+        log.info(f"  ✓ 主模型 -> {MODEL_PKL}  ({MODEL_PKL.stat().st_size/1024:.1f} KB)")
 
-    backup = MODEL_DIR / f"nilm_ac_two_stage_{ts_tag}.pkl"
-    joblib.dump(bundle, backup)
-    log.info(f"  ✓ 备份模型 -> {backup}")
+        backup = MODEL_DIR / f"nilm_ac_two_stage_{ts_tag}.pkl"
+        joblib.dump(bundle, backup)
+        log.info(f"  ✓ 备份模型 -> {backup}")
+    else:
+        # [v15] rf-only: 产出自包含 RF bundle (统一接口所需上下文齐备:
+        #        scaler / feat_cols / feat_names / ON_THR / 切分日期 / LUT 等)
+        _rf_bundle_path = MODEL_DIR / "rf_bundle.pkl"
+        joblib.dump(bundle, _rf_bundle_path)
+        log.info(f"  ✓ RF 基线自包含 bundle -> {_rf_bundle_path}  "
+                 f"({_rf_bundle_path.stat().st_size/1024:.1f} KB)")
 
-    # v6.9 改进: 自动滚动清理, 仅保留最近 MAX_BACKUPS 份带时间戳的备份
-    # (主/v42 各自一份, 避免每次训练后 models/ 目录膨胀)
-    MAX_BACKUPS = 3
-    bk_prefix = "nilm_ac_two_stage_"
-    backups = sorted(
-        [p for p in MODEL_DIR.glob(f"{bk_prefix}*.pkl")
-         if p.name not in {"nilm_ac_two_stage.pkl", "nilm_ac_two_stage_v42.pkl"}],
-        key=lambda p: p.stat().st_mtime, reverse=True,
-    )
-    if len(backups) > MAX_BACKUPS:
-        for old in backups[MAX_BACKUPS:]:
-            try:
-                size_kb = old.stat().st_size / 1024
-                old.unlink()
-                log.info(f"  [清理] 删除旧备份 {old.name} ({size_kb:.1f} KB)")
-            except Exception as e:
-                log.warning(f"  [清理] 删除 {old.name} 失败: {e}")
+    # (主模型路径专属; rf-only 无时间戳备份)
+    if _do_main_flag:
+        # v6.9 改进: 自动滚动清理, 仅保留最近 MAX_BACKUPS 份带时间戳的备份
+        # (主/v42 各自一份, 避免每次训练后 models/ 目录膨胀)
+        MAX_BACKUPS = 3
+        bk_prefix = "nilm_ac_two_stage_"
+        backups = sorted(
+            [p for p in MODEL_DIR.glob(f"{bk_prefix}*.pkl")
+             if p.name not in {"nilm_ac_two_stage.pkl", "nilm_ac_two_stage_v42.pkl"}],
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if len(backups) > MAX_BACKUPS:
+            for old in backups[MAX_BACKUPS:]:
+                try:
+                    size_kb = old.stat().st_size / 1024
+                    old.unlink()
+                    log.info(f"  [清理] 删除旧备份 {old.name} ({size_kb:.1f} KB)")
+                except Exception as e:
+                    log.warning(f"  [清理] 删除 {old.name} 失败: {e}")
 
     # 仅在主模型训练时拆分组件 + 写 meta JSON
     # (NILM_BASELINE_MODE=1 时 03b 调用此脚本, 仅出主 .pkl, 不污染主模型的组件文件)
-    if _os.environ.get("NILM_BASELINE_MODE") != "1":
-        joblib.dump(scaler,   MODEL_DIR / "scaler.pkl")
-        joblib.dump(clf,      MODEL_DIR / "stage1_classifier.pkl")
-        joblib.dump(moe,      MODEL_DIR / "stage2_moe_bundle.pkl")
-        joblib.dump(reg_global_p50,  MODEL_DIR / "stage2_regressor.pkl")        # 全局 fallback
-        joblib.dump(reg_global_low,  MODEL_DIR / "stage2_regressor_p10.pkl")
-        joblib.dump(reg_global_high, MODEL_DIR / "stage2_regressor_p90.pkl")
-        joblib.dump(rf,       MODEL_DIR / "baseline_rf.pkl")
-        meta = {k: v for k, v in bundle.items()
-                if k not in ("scaler", "clf", "rf",
-                             "reg", "reg_low", "reg_high", "moe",
-                             "residual_calib")}
-        # v6: temp_power_lut 含 tuple 键, JSON 不支持, 单独序列化为字符串键再写
-        if "temp_power_lut" in meta and meta["temp_power_lut"] is not None:
-            lut_orig = meta["temp_power_lut"]
-            meta["temp_power_lut"] = {
-                (f"{k[0]:.2f}_{k[1]:.2f}" if isinstance(k, tuple) else str(k)): v
-                for k, v in lut_orig.items()
-            }
-            meta["temp_power_lut_note"] = "tuple keys (lo, hi) 已序列化为 'lo_hi' 字符串"
-        # residual_calib 是对象, JSON 不可表达, 仅记录是否存在
-        meta["residual_calib_present"] = bool(bundle.get("residual_calib"))
-        with open(MODEL_DIR / "model_meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
-        log.info(f"  ✓ 组件拆分 + meta JSON 已保存")
+    # [v15 算法解耦] main 组件与 rf 组件按门控独立落盘, 互不污染:
+    #   - main-only : 不写 baseline_rf.pkl (RF 由 rf 算法模块独立负责)
+    #   - rf-only   : 只写 baseline_rf.pkl + rf_bundle_meta.json
+    if not _is_baseline_mode:
+        if _do_main:
+            joblib.dump(scaler,   MODEL_DIR / "scaler.pkl")
+            joblib.dump(clf,      MODEL_DIR / "stage1_classifier.pkl")
+            joblib.dump(moe,      MODEL_DIR / "stage2_moe_bundle.pkl")
+            joblib.dump(reg_global_p50,  MODEL_DIR / "stage2_regressor.pkl")        # 全局 fallback
+            joblib.dump(reg_global_low,  MODEL_DIR / "stage2_regressor_p10.pkl")
+            joblib.dump(reg_global_high, MODEL_DIR / "stage2_regressor_p90.pkl")
+            meta = {k: v for k, v in bundle.items()
+                    if k not in ("scaler", "clf", "rf",
+                                 "reg", "reg_low", "reg_high", "moe",
+                                 "residual_calib")}
+            # v6: temp_power_lut 含 tuple 键, JSON 不支持, 单独序列化为字符串键再写
+            if "temp_power_lut" in meta and meta["temp_power_lut"] is not None:
+                lut_orig = meta["temp_power_lut"]
+                meta["temp_power_lut"] = {
+                    (f"{k[0]:.2f}_{k[1]:.2f}" if isinstance(k, tuple) else str(k)): v
+                    for k, v in lut_orig.items()
+                }
+                meta["temp_power_lut_note"] = "tuple keys (lo, hi) 已序列化为 'lo_hi' 字符串"
+            # residual_calib 是对象, JSON 不可表达, 仅记录是否存在
+            meta["residual_calib_present"] = bool(bundle.get("residual_calib"))
+            # [v15] 审计字段: 记录本次训练解耦范围
+            meta["algo_mode"] = _algo_select
+            meta["rf_present"] = bool(_do_rf)
+            with open(MODEL_DIR / "model_meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
+            log.info(f"  ✓ 组件拆分 + meta JSON 已保存")
+        if _do_rf:
+            # RF 裸模型独立落盘 (历史消费者兼容; rf 算法模块以 rf_bundle.pkl 为准)
+            joblib.dump(rf, MODEL_DIR / "baseline_rf.pkl")
+        if not _do_main and _do_rf:
+            # rf-only: 写独立 meta (避免与主模型 model_meta.json 冲突)
+            _rf_meta_keys = ("feat_cols", "feat_names", "best_thr", "ON_THR",
+                             "trained_at", "n_train", "n_val", "version",
+                             "split_strategy", "split_ratios",
+                             "use_weather_features", "use_temp_based_season",
+                             "weather_latitude", "weather_longitude",
+                             "n_features", "train_dates", "val_dates", "test_dates")
+            _rf_meta = {k: bundle.get(k) for k in _rf_meta_keys}
+            _rf_meta["algo_mode"] = _algo_select
+            with open(MODEL_DIR / "rf_bundle_meta.json", "w", encoding="utf-8") as f:
+                json.dump(_rf_meta, f, indent=2, ensure_ascii=False, default=str)
+            log.info(f"  ✓ RF 组件拆分 + rf_bundle_meta.json 已保存")
     else:
         log.info(f"  [基线模式] 跳过组件拆分和 meta 保存 (避免覆盖主模型组件)")
 
@@ -1131,22 +1234,24 @@ def main():
     # 而不是主模型 v6.x 的结果, 造成 FN 数等指标与训练日志报告不一致。
     log.info("-" * 70)
     log.info("保存预测明细")
-    if _os.environ.get("NILM_BASELINE_MODE") != "1":
-        save_predictions_csv(t_tr, y_tr, y_pred_tr, s_tr, pred_state_tr, p_tr,
-                             y_pred_low=p_low_tr * pred_state_tr,
-                             y_pred_high=p_high_tr * pred_state_tr,
-                             out_path=PRED_DIR / "train_pred.csv")
-        log.info(f"  ✓ {PRED_DIR / 'train_pred.csv'}")
-        save_predictions_csv(t_va, y_va, y_pred_va, s_va, pred_state_va, p_va,
-                             y_pred_low=p_low_va * pred_state_va,
-                             y_pred_high=p_high_va * pred_state_va,
-                             out_path=PRED_DIR / "val_pred.csv")
-        log.info(f"  ✓ {PRED_DIR / 'val_pred.csv'}")
-        save_predictions_csv(t_tr, y_tr, y_rf_tr,
-                             out_path=PRED_DIR / "train_pred_rf.csv")
-        save_predictions_csv(t_va, y_va, y_rf_va,
-                             out_path=PRED_DIR / "val_pred_rf.csv")
-        log.info(f"  ✓ RF 基线预测已保存")
+    if not _is_baseline_mode:
+        if _do_main:
+            save_predictions_csv(t_tr, y_tr, y_pred_tr, s_tr, pred_state_tr, p_tr,
+                                 y_pred_low=p_low_tr * pred_state_tr,
+                                 y_pred_high=p_high_tr * pred_state_tr,
+                                 out_path=PRED_DIR / "train_pred.csv")
+            log.info(f"  ✓ {PRED_DIR / 'train_pred.csv'}")
+            save_predictions_csv(t_va, y_va, y_pred_va, s_va, pred_state_va, p_va,
+                                 y_pred_low=p_low_va * pred_state_va,
+                                 y_pred_high=p_high_va * pred_state_va,
+                                 out_path=PRED_DIR / "val_pred.csv")
+            log.info(f"  ✓ {PRED_DIR / 'val_pred.csv'}")
+        if _do_rf:
+            save_predictions_csv(t_tr, y_tr, y_rf_tr,
+                                 out_path=PRED_DIR / "train_pred_rf.csv")
+            save_predictions_csv(t_va, y_va, y_rf_va,
+                                 out_path=PRED_DIR / "val_pred_rf.csv")
+            log.info(f"  ✓ RF 基线预测已保存")
     else:
         log.info(f"  [基线模式] 跳过 train_pred/val_pred 写入 (避免覆盖主模型预测)")
 
@@ -1167,41 +1272,44 @@ def main():
     is_baseline_mode = _os.environ.get("NILM_BASELINE_MODE") == "1"
     main_tag = "v42_baseline" if is_baseline_mode else "main"
     rows = []
-    # 1. main 主模型 (train + val) - 单口径, 用训练标签 ON_THR_W=10W 评估
-    rows += flatten_metrics_to_rows("train", main_tag,
-                                    cls_metrics=cls_tr, reg_metrics=reg_tr,
-                                    extra=extra)
-    rows += flatten_metrics_to_rows("val", main_tag,
-                                    cls_metrics=cls_va, reg_metrics=reg_va,
-                                    extra=extra)
-    # 2. main_L4_calib (若 v6 L4 启用)
-    if cls_calib_tr is not None and reg_calib_tr is not None:
-        rows += flatten_metrics_to_rows("train", "main_L4_calib",
-                                        cls_metrics=cls_calib_tr,
-                                        reg_metrics=reg_calib_tr,
-                                        extra={**extra, "note": "L4 残差校正后"})
-        rows += flatten_metrics_to_rows("val", "main_L4_calib",
-                                        cls_metrics=cls_calib_va,
-                                        reg_metrics=reg_calib_va,
-                                        extra={**extra, "note": "L4 残差校正后"})
-    # 3. fallback (MoE 全局回归器)
-    rows += flatten_metrics_to_rows("train", "fallback",
-                                    cls_metrics=cls_fb_tr,
-                                    reg_metrics=reg_fb_tr,
-                                    extra={**extra, "note": "MoE 全局兜底, 无季节路由"})
-    rows += flatten_metrics_to_rows("val", "fallback",
-                                    cls_metrics=cls_fb_va,
-                                    reg_metrics=reg_fb_va,
-                                    extra={**extra, "note": "MoE 全局兜底, 无季节路由"})
-    # 4. rf (单阶段 RandomForest, 现在含分类指标)
-    rows += flatten_metrics_to_rows("train", "rf",
-                                    cls_metrics=cls_rf_tr,
-                                    reg_metrics=reg_rf_tr,
-                                    extra={"note": f"单阶段 RF, ON 阈值=ON_THR_W={ON_THR_W}W"})
-    rows += flatten_metrics_to_rows("val", "rf",
-                                    cls_metrics=cls_rf_va,
-                                    reg_metrics=reg_rf_va,
-                                    extra={"note": f"单阶段 RF, ON 阈值=ON_THR_W={ON_THR_W}W"})
+    # [v15 算法解耦] 主模型行与 RF 行按门控分流
+    if _do_main:
+        # 1. main 主模型 (train + val) - 单口径, 用训练标签 ON_THR_W=10W 评估
+        rows += flatten_metrics_to_rows("train", main_tag,
+                                        cls_metrics=cls_tr, reg_metrics=reg_tr,
+                                        extra=extra)
+        rows += flatten_metrics_to_rows("val", main_tag,
+                                        cls_metrics=cls_va, reg_metrics=reg_va,
+                                        extra=extra)
+        # 2. main_L4_calib (若 v6 L4 启用)
+        if cls_calib_tr is not None and reg_calib_tr is not None:
+            rows += flatten_metrics_to_rows("train", "main_L4_calib",
+                                            cls_metrics=cls_calib_tr,
+                                            reg_metrics=reg_calib_tr,
+                                            extra={**extra, "note": "L4 残差校正后"})
+            rows += flatten_metrics_to_rows("val", "main_L4_calib",
+                                            cls_metrics=cls_calib_va,
+                                            reg_metrics=reg_calib_va,
+                                            extra={**extra, "note": "L4 残差校正后"})
+        # 3. fallback (MoE 全局回归器)
+        rows += flatten_metrics_to_rows("train", "fallback",
+                                        cls_metrics=cls_fb_tr,
+                                        reg_metrics=reg_fb_tr,
+                                        extra={**extra, "note": "MoE 全局兜底, 无季节路由"})
+        rows += flatten_metrics_to_rows("val", "fallback",
+                                        cls_metrics=cls_fb_va,
+                                        reg_metrics=reg_fb_va,
+                                        extra={**extra, "note": "MoE 全局兜底, 无季节路由"})
+    if _do_rf:
+        # 4. rf (单阶段 RandomForest, 现在含分类指标)
+        rows += flatten_metrics_to_rows("train", "rf",
+                                        cls_metrics=cls_rf_tr,
+                                        reg_metrics=reg_rf_tr,
+                                        extra={"note": f"单阶段 RF, ON 阈值=ON_THR_W={ON_THR_W}W"})
+        rows += flatten_metrics_to_rows("val", "rf",
+                                        cls_metrics=cls_rf_va,
+                                        reg_metrics=reg_rf_va,
+                                        extra={"note": f"单阶段 RF, ON 阈值=ON_THR_W={ON_THR_W}W"})
 
     metric_path = METRIC_DIR / "train_val_metrics.csv"
     # v6.10: 统一使用 save_metrics_csv 的 append=True 机制
