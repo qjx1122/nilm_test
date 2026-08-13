@@ -585,3 +585,65 @@ artifacts/
 3. **指标观察**：rf 基线 SAE 显著低于主模型（能量口径误差小），但 F1/Accuracy 略低；v14 相比 main 在 test 集 F1 略升且 SAE 下降，inference 集表现与历史 L5/OOD 场景一致。个体用户（800080270778）main F1 偏低属数据个体差异，不影响框架验证结论。
 4. **产物治理**：artifacts/（15M）+ models/（204M）全部被 .gitignore 隔离，验证运行不污染仓库。
 - **遗留问题**：无阻塞项。800080270778 指标偏低可作后续优化专题（可选）。
+
+---
+
+# [2026-08-13] 专题：v17 各模型训练推理统一访问接口重构报告
+
+> **专题类型**：工程重构 / 统一访问接口 / 算法功能抽象
+> **目标**：针对各模型训练推理功能继续重构代码，提供统一的访问接口——各算法模块的训练/评估/推理功能统一为可调用接口（`train/evaluate/infer` → 结构化结果），流水线不再手工拼装子进程命令。
+
+## 1. 统一访问接口全景
+
+```
+外部调用方 (流水线 / 批量调度 / 测试 / 未来服务)
+      │  统一访问接口
+      ▼
++---------------------------------------------------------------+
+| train_models(names, ctx)  evaluate_models(names, ctx)  infer_models(names, ctx)  ← 注册表级统一多模型入口
+| get_algorithm("main").train(ctx) / .evaluate(ctx) / .infer(ctx)                    ← 单模型统一接口
++---------------------------------------------------------------+
+      │ 组装 (脚本 + 隔离环境 + 算法参数 + 通用参数)               │ StageResult 结构化结果
+      ▼                                                          ▼
++--------------------+        +-----------------------------------------------------+
+| StageRunner        │  ────▶ │ StageResult { algo, stage, status, exit_code,       |
+| 统一阶段执行器      │        │   message, duration_s; ok/is_soft_skip/is_fail }   |
+| (子进程隔离/UTF-8/  │        |  status ∈ ok | soft_skip(11/12/13) | fail          |
+|  超时/日志)         │        +-----------------------------------------------------+
++--------------------+
+```
+
+## 2. 接口清单
+
+| 接口 | 说明 |
+|---|---|
+| `AlgorithmModule.train(ctx, runner=None) -> StageResult` | **统一训练接口**：组装训练脚本 + 隔离环境（train_env）+ 算法参数（train_args）并执行 |
+| `AlgorithmModule.evaluate(ctx, runner=None) -> StageResult` | **统一评估接口**：测试集评估阶段 |
+| `AlgorithmModule.infer(ctx, runner=None) -> StageResult` | **统一推理接口**：自动组装 `--bus`（落地推理总线）/`--branch` 或 `--no-branch`（落地分路）/`--time-filter-spec`（推理时段过滤）通用参数；`ctx.infer_bus_staged` 未落地时 fail-fast |
+| `train_models / evaluate_models / infer_models(names, ctx, runner)` | **注册表级统一多模型入口**：对算法序列逐个执行并返回 `dict[str, StageResult]`，如实透传各算法状态（软跳过/失败不吞掉） |
+| `StageRunner.run(script, args, env, label, ...) -> StageResult` | **统一阶段执行器**：退出码翻译（0→ok / 11,12,13→soft_skip / 其他→fail）、子进程环境隔离、PYTHONIOENCODING UTF-8 端到端、1200s 超时、日志文件旁路 |
+| `StageResult.ok / .is_soft_skip / .is_fail / .summary()` | 结构化结果判定与单行摘要 |
+
+三算法统一 dispatch（实测断言）：
+- main：train→`03_train.py` + `NILM_ALGO_SELECT=main`；eval/infer→`04/05 + --algo main --no-baseline`
+- rf：train→`03_train.py` + `NILM_ALGO_SELECT=rf`；infer 自动加 `--model models/rf_bundle.pkl`
+- v14：train→`14_train_v14.py` + `NILM_V14_*`；eval/infer 同步注入 v14 特征环境（三阶段特征一致性契约）
+
+## 3. 流水线收敛（重构前 → 重构后）
+
+| 原实现 | v17 收敛后 |
+|---|---|
+| 流水线手工拼装 `[PY, script] + args + [--bus ...]` 命令 | `algo_mod.train/evaluate/infer(ctx, runner)` 统一接口 |
+| `run_step` 子进程封装 + `_SoftSkip` 异常驱动流程 | `StageRunner` 统一执行器 + `StageResult` 状态驱动流程（run_step/_SoftSkip 已删除） |
+| 02 对齐共享步骤单独拼装 | 同样经由 `runner.run("02_align_and_feat.py", args, label="02 对齐+特征")` |
+| 软跳过异常捕获 → skip_reason 归档 | `StageResult.is_soft_skip` 分支 → skip_reason 双路归档（算法目录 + 用户扁平目录） |
+
+行为语义逐一保持：软跳过退出码（11/12/13）、skip_reason 归档、推理失败部分归档训练产物、流水线退出码 0/10/1 三态契约、模型复用契约。
+
+## 4. 验证记录
+
+- **新增单测 12 项**（`test_algo_runner.py`）：真实子进程退出码映射与软跳过集合、环境注入隔离（父进程零污染）、三算法 dispatch 组装断言、推理通用参数自动组装（含 no-branch/时段过滤/未落地 fail-fast）、注册表级多模型入口顺序与状态透传、StageResult 判定属性与摘要。
+- **流水线冒烟 4 用例**（single/multi/all/模型复用）通过——统一接口重构后行为等价。
+- **软跳过新路径验证**：半天级小数据触发数据质量门 11 → 流水线退出码 10 + `skip_reason.json` 双路归档，与 v15 语义一致。
+- **回归**：既有 9 个单测脚本（算法注册 13 / 配置解析 11 / 三大数据模块 27 / 执行状态 / 复合目标列 / 日级原始点数 / min_w 列）全部通过；批量层 dry-run 正常。
+- **遗留问题**：暂无。未来新算法接入 = 继承 `AlgorithmModule` + 注册一行，即自动获得训练/推理统一访问接口与流水线调度能力。

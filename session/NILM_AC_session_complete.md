@@ -6259,3 +6259,21 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
   - 分支：`arena/019ff4a0-nilm-test`
   - 产物（gitignored，不入库）：`artifacts/`(15M)、`models/`(204M)、`logs/_batch/`
   - 文档：`STATUS.md`、`REPORT_TEST.md`（v16 验证测试专题）、本纪要
+
+---
+
+## [2026-08-13] 会话纪要（v17 各模型训练推理统一访问接口重构）
+- 目标：针对各模型训练推理功能继续重构代码，提供统一的访问接口。
+- 完成项：
+  1. 新增 `scripts/algorithms/runner.py`：StageRunner 统一阶段执行器（子进程隔离/UTF-8/超时/日志旁路）+ StageResult 结构化结果（ok/soft_skip/fail 三态，退出码 0/11/12/13 翻译）。
+  2. `AlgorithmModule` 新增统一访问接口：train/evaluate/infer(ctx, runner) → StageResult；infer() 自动组装 --bus/--branch|--no-branch/--time-filter-spec 通用参数；AlgoContext 新增 infer_bus_staged/infer_branch_staged。
+  3. 注册表级统一多模型入口：train_models/evaluate_models/infer_models(names, ctx, runner) → dict[str, StageResult]。
+  4. 流水线收敛：删除 run_step 手工命令拼装与 _SoftSkip 异常流，02/03/04/05 全部经由统一执行器，StageResult 驱动流程分支（软跳过归档、部分归档、退出码三态契约语义保持）。
+  5. 验证：新增 12 项单测（假执行器录制 + 真实子进程）；流水线 4 用例冒烟；软跳过路径（数据质量门 11 → 退出码 10 + skip_reason 双路归档）；既有 9 个单测脚本回归；批量 dry-run 正常。
+- 关键决策：见 STATUS.md「决策记录」（配方式→函数式统一接口、执行与结果分离、异常流改结果流、注入式 runner 可测试性）。
+- 未决问题：无。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 新增：`scripts/algorithms/runner.py`、`scripts/test_algo_runner.py`
+  - 修改：`scripts/algorithms/base.py`、`registry.py`、`__init__.py`、`scripts/run_user_pipeline.py`
+  - 文档：`STATUS.md`、`REPORT_TEST.md`（v17 专题）、本纪要
