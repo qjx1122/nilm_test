@@ -49,7 +49,7 @@ import pandas as pd
 
 from common import (INFER_BUS_CSV, INFER_BR_CSV,    # v6.12.6+v6.15.0 推理路径独立
                     BUS_CSV, BR_CSV,                # 兼容: 训练路径仍然可读
-                    MODEL_PKL, MODEL_DIR, PRED_DIR, METRIC_DIR,
+                    MODEL_PKL, PRED_DIR, METRIC_DIR,
                     ARTIFACT_DIR,
                     ON_THR_W,             # v6.12.6 单一阈值
                     TARGET_COL,           # v13.16 复合列物化需要
@@ -65,16 +65,17 @@ from expert_utils import assign_season
 from baseline_utils import (BaselineRegistry, BaselineRunner,
                             merge_predictions, cross_model_consistency)
 from residual_calibrator import ResidualCalibrator, ModelSwitcher
-from metrics_utils import (compute_classification_metrics,
-                           compute_regression_metrics,
-                           save_predictions_csv,
-                           flatten_metrics_to_rows,
-                           save_metrics_csv,
-                           build_comparison_table,
-                           build_leak_ood_metric_rows,
-                           build_daily_metrics_rows,
-                           save_daily_metrics_csv,
-                           compute_raw_daily_counts)  # v13.16
+# [v16 数据模块解耦] 指标/预测写出统一走数据输出模块
+from data_output import (compute_classification_metrics,
+                         compute_regression_metrics,
+                         save_predictions_csv,
+                         flatten_metrics_to_rows,
+                         save_metrics_csv,
+                         build_comparison_table,
+                         build_leak_ood_metric_rows,
+                         build_daily_metrics_rows,
+                         save_daily_metrics_csv,
+                         compute_raw_daily_counts)  # v13.16
 
 log = get_logger("infer")
 
@@ -188,12 +189,14 @@ def main():
     metric_out  = Path(args.metric_out)
     baselines   = [] if args.no_baseline else (list(args.baseline) if args.baseline else [])
 
-    # [v15 算法解耦] rf 算法: 优先加载自包含 rf_bundle.pkl; 缺失时回退主模型 bundle (旧布局)
+    # [v15/v16] rf 算法: 模型路径解析统一走数据输出模块 (自包含 rf_bundle.pkl 优先,
+    # 缺失时回退主模型 bundle 旧布局)
     if args.algo == "rf" and not model_path.exists():
-        _rf_bundle = MODEL_DIR / "rf_bundle.pkl"
-        if _rf_bundle.exists():
-            log.info(f"  [v15] rf 算法推理: 切换模型路径 -> {_rf_bundle}")
-            model_path = _rf_bundle
+        from data_output import resolve_model_path
+        _resolved = resolve_model_path("rf", model_path)
+        if _resolved != model_path:
+            log.info(f"  [v15] rf 算法推理: 切换模型路径 -> {_resolved}")
+            model_path = _resolved
 
     log.info("=" * 70)
     log.info(f"Step 5: 独立推理 (v5: 多基线对比, v15: algo={args.algo})")
@@ -263,19 +266,21 @@ def main():
                          f"{' + '.join(TARGET_COL.split('+'))} 逐行求和")
 
     # ---------- 3b. [v12] 时段过滤 (在对齐前) ----------
-    try:
-        from time_filter_utils import cli_arg_to_spec, apply_time_filter, spec_summary
-        _tf_spec = cli_arg_to_spec(args.time_filter_spec)
+    # [v16 数据模块解耦] 解析/应用统一走数据输入模块时段过滤入口
+    from data_input import parse_time_filter_spec, apply_time_filter_spec
+    from data_config import spec_summary
+    if args.time_filter_spec.strip():
+        _tf_spec = parse_time_filter_spec(args.time_filter_spec)
         if _tf_spec is not None:
             log.info(f"  [v12 推理时段过滤] 规格: {spec_summary(_tf_spec)}")
-            bus = apply_time_filter(bus, "event_time", _tf_spec, "infer_bus", logger=log)
-            if branch is not None:
-                branch = apply_time_filter(branch, "time", _tf_spec, "infer_branch", logger=log)
-            if len(bus) == 0:
-                log.error("[v12 时段过滤] 过滤后总线为空, 无法推理")
-                return 1
-    except ImportError:
-        pass
+    bus = apply_time_filter_spec(bus, "event_time", args.time_filter_spec,
+                                 "infer_bus", logger=log)
+    if branch is not None:
+        branch = apply_time_filter_spec(branch, "time", args.time_filter_spec,
+                                        "infer_branch", logger=log)
+    if args.time_filter_spec.strip() and len(bus) == 0:
+        log.error("[v12 时段过滤] 过滤后总线为空, 无法推理")
+        return 1
 
     # ---------- 4. 对齐 + 特征工程 ----------
     with Timer("重采样 + 对齐 + 特征工程", log):

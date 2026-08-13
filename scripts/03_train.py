@@ -23,7 +23,6 @@ Step 3: 模型训练 v5 (温度特征 + 温度驱动季节路由)
 """
 import json
 import sys
-import joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -63,11 +62,14 @@ from weather_utils import get_weather_for_period
 from drift_features import (build_temp_power_lut,
                             export_temp_power_lut_csv)  # v13.15 CSV 导出
 from residual_calibrator import ResidualCalibrator
-from metrics_utils import (compute_classification_metrics,
-                           compute_regression_metrics,
-                           save_predictions_csv,
-                           flatten_metrics_to_rows,
-                           save_metrics_csv)
+# [v16 数据模块解耦] 指标/预测写出与模型资产持久化统一走数据输出模块
+from data_output import (compute_classification_metrics,
+                         compute_regression_metrics,
+                         save_predictions_csv,
+                         flatten_metrics_to_rows,
+                         save_metrics_csv,
+                         save_model_bundle,
+                         save_model_components)
 
 log = get_logger("train")
 
@@ -806,7 +808,8 @@ def main():
                     raise _SkipD87Guard()
             log.info("  [v6.12.1] 计算 d87 守卫自适应阈值元数据 ...")
             # 重新加载 5min 原始 bus 与 branch (训练时只有 15min 对齐数据)
-            from feature_utils import load_bus_csv, load_branch_csv
+            # [v16] 原始数据加载统一走数据输入模块
+            from data_input import load_bus_csv, load_branch_csv
             _bus_raw, _ = load_bus_csv(BUS_CSV)
             _br_raw     = load_branch_csv(BR_CSV)
             _bus_raw["ts"] = pd.to_datetime(_bus_raw["event_time"])
@@ -1141,40 +1144,17 @@ def main():
         # v6.12.1: d87 守卫自适应阈值元数据
         "d87_guard_meta":        d87_guard_meta,
     }
+    # [v16 数据模块解耦] 模型资产持久化统一走数据输出模块接口
     if _do_main:
-        joblib.dump(bundle, MODEL_PKL)
-        log.info(f"  ✓ 主模型 -> {MODEL_PKL}  ({MODEL_PKL.stat().st_size/1024:.1f} KB)")
-
-        backup = MODEL_DIR / f"nilm_ac_two_stage_{ts_tag}.pkl"
-        joblib.dump(bundle, backup)
-        log.info(f"  ✓ 备份模型 -> {backup}")
+        save_model_bundle(bundle, MODEL_PKL, backup_tag=ts_tag,
+                          backup_prefix="nilm_ac_two_stage_", max_backups=3,
+                          backup_exclude={"nilm_ac_two_stage.pkl",
+                                          "nilm_ac_two_stage_v42.pkl"},
+                          logger=log)
     else:
         # [v15] rf-only: 产出自包含 RF bundle (统一接口所需上下文齐备:
         #        scaler / feat_cols / feat_names / ON_THR / 切分日期 / LUT 等)
-        _rf_bundle_path = MODEL_DIR / "rf_bundle.pkl"
-        joblib.dump(bundle, _rf_bundle_path)
-        log.info(f"  ✓ RF 基线自包含 bundle -> {_rf_bundle_path}  "
-                 f"({_rf_bundle_path.stat().st_size/1024:.1f} KB)")
-
-    # (主模型路径专属; rf-only 无时间戳备份)
-    if _do_main_flag:
-        # v6.9 改进: 自动滚动清理, 仅保留最近 MAX_BACKUPS 份带时间戳的备份
-        # (主/v42 各自一份, 避免每次训练后 models/ 目录膨胀)
-        MAX_BACKUPS = 3
-        bk_prefix = "nilm_ac_two_stage_"
-        backups = sorted(
-            [p for p in MODEL_DIR.glob(f"{bk_prefix}*.pkl")
-             if p.name not in {"nilm_ac_two_stage.pkl", "nilm_ac_two_stage_v42.pkl"}],
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-        if len(backups) > MAX_BACKUPS:
-            for old in backups[MAX_BACKUPS:]:
-                try:
-                    size_kb = old.stat().st_size / 1024
-                    old.unlink()
-                    log.info(f"  [清理] 删除旧备份 {old.name} ({size_kb:.1f} KB)")
-                except Exception as e:
-                    log.warning(f"  [清理] 删除 {old.name} 失败: {e}")
+        save_model_bundle(bundle, MODEL_DIR / "rf_bundle.pkl", logger=log)
 
     # 仅在主模型训练时拆分组件 + 写 meta JSON
     # (NILM_BASELINE_MODE=1 时 03b 调用此脚本, 仅出主 .pkl, 不污染主模型的组件文件)
@@ -1183,12 +1163,14 @@ def main():
     #   - rf-only   : 只写 baseline_rf.pkl + rf_bundle_meta.json
     if not _is_baseline_mode:
         if _do_main:
-            joblib.dump(scaler,   MODEL_DIR / "scaler.pkl")
-            joblib.dump(clf,      MODEL_DIR / "stage1_classifier.pkl")
-            joblib.dump(moe,      MODEL_DIR / "stage2_moe_bundle.pkl")
-            joblib.dump(reg_global_p50,  MODEL_DIR / "stage2_regressor.pkl")        # 全局 fallback
-            joblib.dump(reg_global_low,  MODEL_DIR / "stage2_regressor_p10.pkl")
-            joblib.dump(reg_global_high, MODEL_DIR / "stage2_regressor_p90.pkl")
+            _components = {
+                "scaler.pkl": scaler,
+                "stage1_classifier.pkl": clf,
+                "stage2_moe_bundle.pkl": moe,
+                "stage2_regressor.pkl": reg_global_p50,        # 全局 fallback
+                "stage2_regressor_p10.pkl": reg_global_low,
+                "stage2_regressor_p90.pkl": reg_global_high,
+            }
             meta = {k: v for k, v in bundle.items()
                     if k not in ("scaler", "clf", "rf",
                                  "reg", "reg_low", "reg_high", "moe",
@@ -1206,12 +1188,11 @@ def main():
             # [v15] 审计字段: 记录本次训练解耦范围
             meta["algo_mode"] = _algo_select
             meta["rf_present"] = bool(_do_rf)
-            with open(MODEL_DIR / "model_meta.json", "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
-            log.info(f"  ✓ 组件拆分 + meta JSON 已保存")
+            save_model_components(_components, MODEL_DIR, meta=meta,
+                                  meta_name="model_meta.json", logger=log)
         if _do_rf:
             # RF 裸模型独立落盘 (历史消费者兼容; rf 算法模块以 rf_bundle.pkl 为准)
-            joblib.dump(rf, MODEL_DIR / "baseline_rf.pkl")
+            save_model_components({"baseline_rf.pkl": rf}, MODEL_DIR, logger=log)
         if not _do_main and _do_rf:
             # rf-only: 写独立 meta (避免与主模型 model_meta.json 冲突)
             _rf_meta_keys = ("feat_cols", "feat_names", "best_thr", "ON_THR",
@@ -1222,9 +1203,8 @@ def main():
                              "n_features", "train_dates", "val_dates", "test_dates")
             _rf_meta = {k: bundle.get(k) for k in _rf_meta_keys}
             _rf_meta["algo_mode"] = _algo_select
-            with open(MODEL_DIR / "rf_bundle_meta.json", "w", encoding="utf-8") as f:
-                json.dump(_rf_meta, f, indent=2, ensure_ascii=False, default=str)
-            log.info(f"  ✓ RF 组件拆分 + rf_bundle_meta.json 已保存")
+            save_model_components({}, MODEL_DIR, meta=_rf_meta,
+                                  meta_name="rf_bundle_meta.json", logger=log)
     else:
         log.info(f"  [基线模式] 跳过组件拆分和 meta 保存 (避免覆盖主模型组件)")
 

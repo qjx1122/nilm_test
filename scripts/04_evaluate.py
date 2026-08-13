@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from common import (ARTIFACT_DIR, MODEL_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PROJECT_VERSION,
+from common import (ARTIFACT_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PROJECT_VERSION,
                     BUS_CSV, BR_CSV,     # v13.16 daily raw counts 需要
                     ON_THR_W,             # v6.12.6 单一阈值
                     setup_chinese_font,
@@ -22,14 +22,15 @@ from common import (ARTIFACT_DIR, MODEL_DIR, MODEL_PKL, PRED_DIR, METRIC_DIR, PR
                     SUMMER_TEMP_THRESHOLD, WINTER_TEMP_THRESHOLD,
                     get_logger, Timer)
 from feature_utils import build_features, assert_no_nan_features
-from metrics_utils import (build_daily_metrics_rows, save_daily_metrics_csv,
-                           compute_raw_daily_counts)  # v13.16
+# [v16 数据模块解耦] 指标/预测写出统一走数据输出模块
+from data_output import (build_daily_metrics_rows, save_daily_metrics_csv,
+                         compute_raw_daily_counts)  # v13.16
 from postprocess import apply_postprocess
 from split_utils import make_splits
 from weather_utils import get_weather_for_period
 from expert_utils import assign_season, SEASON_LABELS
 from baseline_utils import BaselineRegistry, BaselineRunner
-from metrics_utils import (compute_classification_metrics,
+from data_output import (compute_classification_metrics,
                            compute_regression_metrics,
                            save_predictions_csv,
                            flatten_metrics_to_rows,
@@ -103,13 +104,14 @@ def main():
     model_path = Path(args.model)
     baselines = [] if args.no_baseline else (list(args.baseline) if args.baseline else [])
 
-    # [v15 算法解耦] rf 算法: 优先加载自包含 rf_bundle.pkl (03_train NILM_ALGO_SELECT=rf 产出);
-    # 缺失时回退主模型 bundle (旧版合并训练布局, bundle 内含 'rf' 字段).
+    # [v15/v16] rf 算法: 模型路径解析统一走数据输出模块 (自包含 rf_bundle.pkl 优先,
+    # 缺失时回退主模型 bundle 旧布局)
     if args.algo == "rf" and not model_path.exists():
-        _rf_bundle = MODEL_DIR / "rf_bundle.pkl"
-        if _rf_bundle.exists():
-            log.info(f"  [v15] rf 算法评估: 切换模型路径 -> {_rf_bundle}")
-            model_path = _rf_bundle
+        from data_output import resolve_model_path
+        _resolved = resolve_model_path("rf", model_path)
+        if _resolved != model_path:
+            log.info(f"  [v15] rf 算法评估: 切换模型路径 -> {_resolved}")
+            model_path = _resolved
 
     log.info("=" * 70)
     log.info(f"Step 4: 测试集评估 (v5: 多基线, v15: algo={args.algo})")

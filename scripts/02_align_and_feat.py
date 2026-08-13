@@ -11,7 +11,8 @@ import pandas as pd
 import numpy as np
 from common import (BUS_CSV, BR_CSV, ARTIFACT_DIR, RESAMPLE, TARGET_COL,
                     get_logger, Timer)
-from feature_utils import load_bus_csv, load_branch_csv, resample_and_align
+# [v16 数据模块解耦] 原始数据加载统一走数据输入模块
+from data_input import load_bus_csv, load_branch_csv, resample_and_align
 
 log = get_logger("align")
 
@@ -57,9 +58,9 @@ def main():
 
         # [v12] 新时段过滤 (统一路径)
         try:
-            from time_filter_utils import (
-                cli_arg_to_spec, apply_time_filter, parse_ranges, spec_summary,
-            )
+            # [v16 数据模块解耦] 时段过滤解析/摘要走数据配置模块, 应用走数据输入模块
+            from data_config import cli_arg_to_spec, parse_ranges, spec_summary
+            from data_input import apply_time_filter
             spec = cli_arg_to_spec(args.time_filter_spec)
             # 把 legacy --exclude-dates 合并到 spec 的 exclude
             if legacy_exclude_ranges:
