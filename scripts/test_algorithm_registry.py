@@ -67,6 +67,11 @@ def test_registry_interface_contract():
     assert env14["NILM_V14_ENABLE"] == "1"
     assert env14["NILM_V14_PHYSICS_FEATURES"] == "1"
     assert env14["NILM_V14_FOCAL"] == "0"
+    # 特征一致性契约: v14 物理特征环境必须在 训练/评估/推理 三阶段一致注入
+    for _env_fn in ("train_env", "eval_env", "infer_env"):
+        _e = getattr(REGISTERED_ALGORITHMS["v14"], _env_fn)(ctx14)
+        assert _e["NILM_V14_PHYSICS_FEATURES"] == "1", f"v14 {_env_fn} 缺物理特征环境"
+        assert _e["NILM_V14_ENABLE"] == "1", f"v14 {_env_fn} 缺启用环境"
 
 
 def test_v14_flags_to_env():

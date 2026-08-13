@@ -27,6 +27,9 @@ class RfBaselineModule(AlgorithmModule):
     )
     stage_algo_flag = "rf"
 
+    def bundle_file_name(self, ctx: AlgoContext) -> str:
+        return "rf_bundle.pkl"
+
     def train_env(self, ctx: AlgoContext) -> dict:
         # 训练解耦门控: 仅训练 RF 基线, 跳过主模型全部环节
         return {"NILM_ALGO_SELECT": "rf"}

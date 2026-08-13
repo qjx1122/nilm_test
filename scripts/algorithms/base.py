@@ -109,6 +109,14 @@ class AlgorithmModule(ABC):
         """阶段脚本实际加载模型的顶层目录: models/ (运行期临时槽位)"""
         return ctx.project_root / "models"
 
+    def bundle_file_name(self, ctx: AlgoContext) -> str:
+        """训练后位于 models/ 顶层的自包含 bundle 文件名.
+
+        供流水线读取切分日期 / ON 阈值等统一接口上下文 (训练后 analyze、评估过滤).
+        main/v14 共用主模型槽位名; rf 用自己的自包含 bundle.
+        """
+        return "nilm_ac_two_stage.pkl"
+
     def check_model_complete(self, ctx: AlgoContext):
         """按 required_model_files 契约检查该算法模型资产是否完整。
 

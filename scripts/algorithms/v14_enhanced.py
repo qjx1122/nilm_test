@@ -72,6 +72,14 @@ class V14Module(AlgorithmModule):
         env.update(v14_flags_to_env(ctx.v14_flags_spec))
         return env
 
+    def eval_env(self, ctx: AlgoContext) -> dict:
+        # 特征一致性契约: 物理指纹增强特征在 训练/评估/推理 三阶段必须同开同关,
+        # 否则 scaler 特征维度不匹配 (如训练 170 维 vs 评估 137 维)
+        return v14_flags_to_env(ctx.v14_flags_spec)
+
+    def infer_env(self, ctx: AlgoContext) -> dict:
+        return v14_flags_to_env(ctx.v14_flags_spec)
+
     def eval_args(self, ctx: AlgoContext) -> list:
         return ["--algo", "main", "--no-baseline"]
 
