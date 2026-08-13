@@ -6242,3 +6242,20 @@ user_id,status,success,started_at,finished_at,duration_s,message,target_col,run_
   - 新增：`scripts/data_config.py`、`scripts/data_input.py`、`scripts/data_output.py`、`scripts/test_data_config.py`、`scripts/test_data_input.py`、`scripts/test_data_output.py`
   - 修改：`scripts/run_batch_users.py`、`run_user_pipeline.py`、`02_align_and_feat.py`、`03_train.py`、`04_evaluate.py`、`05_inference.py`、`test_batch_execution_state.py`
   - 文档：`STATUS.md`、`REPORT_TEST.md`（v16 专题）、本纪要
+
+---
+
+## [2026-08-13] 会话纪要（v16 重构后全量批量验证测试：5 用户 × 3 算法全流程重跑）
+- 目标：在 v15 多算法解耦 + v16 三大数据模块解耦重构完成后，对全部 5 个真实用户数据重新执行批量训练+评估+推理全流程验证测试。
+- 完成项：
+  1. 执行前侦察：数据规模（最大用户总线 6.7MB）与 .gitignore 产物隔离确认；单用户探针实测（main 234s、rf+v14 370s，合计约 10 分钟/用户，低于批量层 20 分钟超时保护）。
+  2. 全量批量执行：`run_batch_users.py --algo-mode all --force-retrain --continue-on-error`（all 模式遍历 main→rf→v14），后台长任务运行 + 执行状态 CSV 增量监控。
+  3. 执行结果：5/5 用户成功、0 软跳过、0 失败，总耗时 1694.8s（28.2 分钟），单用户耗时 192~597s。
+  4. 产物体检 77/77 项通过（/tmp/validate_report.py 结构化校验）：30 个算法子目录非空、15 组模型资产契约齐全、三分集预测与三算法推理指标齐全、汇总表 60 行（含 algo 列）、状态表 5 行全 ok。
+  5. 指标汇总：test 集 main F1=0.765/SAE=17.4%、rf F1=0.755/SAE=11.8%、v14 F1=0.769/SAE=14.7%；inference 集 main F1=0.873/SAE=17.2%、rf F1=0.817/SAE=3.4%、v14 F1=0.870/SAE=18.1%。
+- 关键决策：见 STATUS.md「决策记录」（执行方案选择：all 模式单次全量；验证结论：重构回归验收通过、多算法解耦隔离生效）。
+- 未决问题：无阻塞项。用户 800080270778 的 main test F1=0.502 偏低属个体数据差异，可作后续优化专题（可选）。
+- 相关文件/分支：
+  - 分支：`arena/019ff4a0-nilm-test`
+  - 产物（gitignored，不入库）：`artifacts/`(15M)、`models/`(204M)、`logs/_batch/`
+  - 文档：`STATUS.md`、`REPORT_TEST.md`（v16 验证测试专题）、本纪要
